@@ -1,0 +1,5 @@
+# yuque2git scripts - Python 3.9+
+httpx>=0.24.0
+pyyaml>=6.0
+fastapi>=0.100.0
+uvicorn[standard]>=0.22.0
