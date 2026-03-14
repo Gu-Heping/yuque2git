@@ -52,6 +52,7 @@ ENABLE_UPDATE_SUMMARY = os.environ.get("ENABLE_UPDATE_SUMMARY", "true").lower() 
 GIT_PUSH_ON_PUSH = os.environ.get("GIT_PUSH_ON_PUSH", "false").lower() in ("1", "true", "yes")
 DIFF_MAX_CHARS = int(os.environ.get("DIFF_MAX_CHARS", "6000"))  # 截断 diff 给 LLM 的长度
 LLM_TIMEOUT = float(os.environ.get("LLM_TIMEOUT", "25.0"))
+ENABLE_BODY_ONLY_DIFF = os.environ.get("ENABLE_BODY_ONLY_DIFF", "true").lower() in ("1", "true", "yes")  # 只对正文做 diff，省 token
 
 
 # --- Pydantic 模型（与语雀 Webhook 兼容）---
@@ -264,6 +265,21 @@ def _find_doc_path_by_yuque_id(output_dir: Path, repo_slug: str, yuque_id: int) 
     return None
 
 
+def _extract_body(md_text: str) -> str:
+    """从 Markdown 中取出正文：去掉 YAML frontmatter 与元数据表格。"""
+    if not md_text or "---" not in md_text:
+        return md_text
+    parts = md_text.split("---", 2)
+    if len(parts) < 3:
+        return md_text
+    after = parts[2].lstrip("\n")
+    lines = after.split("\n")
+    i = 0
+    while i < len(lines) and (not lines[i].strip() or lines[i].strip().startswith("|")):
+        i += 1
+    return "\n".join(lines[i:]).strip()
+
+
 def _get_index_at_commit(output_dir: Path, commit: str) -> Dict[str, str]:
     """从指定 commit 读取 .yuque-id-to-path.json。"""
     r = subprocess.run(
@@ -285,12 +301,31 @@ def _get_diff(
     base_commit: Optional[str],
     rel_path: str,
     yuque_id: Optional[int] = None,
+    body_only: bool = True,
 ) -> str:
-    """生成「上次推送 → 当前」的 diff；文档移动时用索引查旧路径做两文件 diff。"""
+    """生成「上次推送 → 当前」的 diff；body_only 时只对正文做 diff 以省 token。"""
+    def _two_file_diff(old_c: str, new_c: str, from_f: str, to_f: str) -> str:
+        if body_only:
+            old_c = _extract_body(old_c)
+            new_c = _extract_body(new_c)
+        u = difflib.unified_diff(
+            old_c.splitlines(keepends=True),
+            new_c.splitlines(keepends=True),
+            fromfile=from_f,
+            tofile=to_f,
+            lineterm="",
+        )
+        d = "".join(u)
+        if len(d) > DIFF_MAX_CHARS:
+            d = d[:DIFF_MAX_CHARS] + "\n... (已截断)"
+        return d
+
     if not base_commit:
         full_path = output_dir / rel_path
         if full_path.exists():
             text = full_path.read_text(encoding="utf-8")
+            if body_only:
+                text = _extract_body(text)
             return f"[首次同步或从未推送]\n\n{text[:4000]}" + ("..." if len(text) > 4000 else "")
         return "[无基准，当前文件不存在]"
 
@@ -308,19 +343,23 @@ def _get_diff(
         new_path = output_dir / rel_path
         new_content = new_path.read_text(encoding="utf-8") if new_path.exists() else ""
         old_content = (r_old.stdout or "") if r_old.returncode == 0 else ""
-        u = difflib.unified_diff(
-            old_content.splitlines(keepends=True),
-            new_content.splitlines(keepends=True),
-            fromfile=old_path,
-            tofile=rel_path,
-            lineterm="",
-        )
-        diff = "".join(u)
+        diff = _two_file_diff(old_content, new_content, old_path, rel_path)
         if not diff.strip():
-            diff = "[文档移动，内容无变更]"
-        if len(diff) > DIFF_MAX_CHARS:
-            diff = diff[:DIFF_MAX_CHARS] + "\n... (已截断)"
+            return "[文档移动，内容无变更]"
         return diff
+
+    if body_only:
+        r_old = subprocess.run(
+            ["git", "show", f"{base_commit}:{rel_path}"],
+            cwd=output_dir,
+            capture_output=True,
+            text=True,
+        )
+        old_content = (r_old.stdout or "") if r_old.returncode == 0 else ""
+        new_path = output_dir / rel_path
+        new_content = new_path.read_text(encoding="utf-8") if new_path.exists() else ""
+        diff = _two_file_diff(old_content, new_content, rel_path, rel_path)
+        return diff or "[无文本变更]"
 
     r = subprocess.run(
         ["git", "diff", base_commit, "HEAD", "--", rel_path],
@@ -625,7 +664,9 @@ async def webhook(request: Request):
         # 智能推送：diff + LLM 或 OpenClaw
         last_push = _read_last_push(OUTPUT_DIR)
         base_commit = last_push.get(str(data.id))
-        diff_text = _get_diff(OUTPUT_DIR, base_commit, rel_path, yuque_id=data.id)
+        diff_text = _get_diff(
+            OUTPUT_DIR, base_commit, rel_path, yuque_id=data.id, body_only=ENABLE_BODY_ONLY_DIFF
+        )
 
         if PUSH_DECISION_MODE == "openclaw":
             await _openclaw_callback(
@@ -640,11 +681,15 @@ async def webhook(request: Request):
             return Response(status_code=200, content="ok")
 
         if PUSH_DECISION_MODE == "llm":
-            should_push, update_summary = await _llm_should_push(
-                diff_text,
-                detail.get("title", "") or slug,
-                data.book.name or "",
-            )
+            if diff_text.strip() in ("[无文本变更]", "[文档移动，内容无变更]"):
+                logger.info("Push decision: skip (no content change), no LLM call")
+                should_push, update_summary = False, None
+            else:
+                should_push, update_summary = await _llm_should_push(
+                    diff_text,
+                    detail.get("title", "") or slug,
+                    data.book.name or "",
+                )
             if should_push and commit_hash:
                 _update_last_push_for(OUTPUT_DIR, data.id, commit_hash)
                 if GIT_PUSH_ON_PUSH:

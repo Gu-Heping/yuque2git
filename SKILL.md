@@ -48,6 +48,7 @@
 | `GIT_PUSH_ON_PUSH` | 可选，`true` 时在判定推送后执行 `git push`，默认 false |
 | `DIFF_MAX_CHARS` | 可选，给 LLM 的 diff 最大字符数，默认 6000 |
 | `LLM_TIMEOUT` | 可选，LLM 请求超时秒数，默认 25 |
+| `ENABLE_BODY_ONLY_DIFF` | 可选，`true` 时只对正文做 diff（去掉 frontmatter/表格），省 token、降噪，默认 true |
 | **OpenClaw 模式** | |
 | `OPENCLAW_CALLBACK_URL` | 待判定事件 POST 的 URL；完成后由 OpenClaw 调用本服务 `POST /mark-pushed` |
 | `WEBHOOK_SECRET` | 可选，校验语雀 Webhook 签名 |
@@ -87,7 +88,7 @@
 ## 智能推送与两种模式
 
 - **Diff 基准**：以「最后推送时的文档状态」与当前状态做 diff，由 AI 或 OpenClaw 判定是否推送。
-- **LLM 模式**（`PUSH_DECISION_MODE=llm`）：服务内调 LLM 得 YES/NO 与可选更新总结；需配置 `OPENAI_API_KEY` 等；若推送则调用 `NOTIFY_URL` 并更新 last-push。
+- **LLM 模式**（`PUSH_DECISION_MODE=llm`）：服务内调 LLM 得 YES/NO 与可选更新总结；需配置 `OPENAI_API_KEY` 等。无实质变更（diff 为「无文本变更」或「文档移动内容无变更」）时**不调 LLM**，直接不推送以省 token。默认只对**正文**做 diff（`ENABLE_BODY_ONLY_DIFF=true`），若推送则调用 `NOTIFY_URL` 并更新 last-push。
 - **OpenClaw 模式**（`PUSH_DECISION_MODE=openclaw`）：服务把待判定事件 POST 到 `OPENCLAW_CALLBACK_URL`，由 OpenClaw 自定义判断与推送方式；完成后回调本服务 `POST /mark-pushed`（body 含 `yuque_id` 与 `commit`）更新 last-push。
 
 ## 元数据
