@@ -23,11 +23,33 @@
 |----------|------|
 | `YUQUE_TOKEN` | 语雀 API Token，必填 |
 | `YUQUE_BASE_URL` | 语雀 API 基地址，可选，默认 `https://nova.yuque.com/api/v2` |
+| **全量同步限流**（`sync_to_files.py`） | 降低触发语雀 429 的概率 |
+| `YUQUE_SYNC_CONCURRENCY` | 并发请求数，默认 3 |
+| `YUQUE_SYNC_REQUEST_DELAY` | 每次请求成功后的间隔秒数，默认 0.25 |
+| `YUQUE_SYNC_MAX_RETRIES` | 遇 429/5xx 时最大重试次数，默认 4；会按 Retry-After 或指数退避等待 |
 | `OUTPUT_DIR` | 输出目录（Git 仓库根），与 CLI `--output-dir` 二选一 |
 | `PUSH_DECISION_MODE` | `llm` 或 `openclaw`：推送由本机 LLM 判定，或由 OpenClaw 回调判定 |
-| `OPENAI_API_KEY` / `OPENAI_BASE_URL` | LLM 模式时必填 |
-| `OPENCLAW_CALLBACK_URL` | OpenClaw 模式时，待判定事件 POST 的 URL |
-| `NOTIFY_URL` | LLM 模式可选；判定推送后 POST 通知（含 update_summary 等） |
+| **LLM 模式** | |
+| `OPENAI_API_KEY` | LLM 模式必填（使用自定义认证头时可与下面二选一） |
+| `OPENAI_BASE_URL` | 可选，默认 `https://api.openai.com/v1`，可改为任意 OpenAI 兼容或自建 API 基地址 |
+| `OPENAI_CHAT_ENDPOINT` | 可选，默认 `chat/completions`，与 BASE_URL 拼接成完整请求 URL |
+| `OPENAI_AUTH_HEADER_NAME` | 可选，自定义认证头名（如 `X-API-Key`），需与 `OPENAI_AUTH_HEADER_VALUE` 同时设置 |
+| `OPENAI_AUTH_HEADER_VALUE` | 可选，自定义认证头取值；未设置时默认使用 `Authorization: Bearer OPENAI_API_KEY` |
+| `OPENAI_MODEL` | 可选，默认 `gpt-4o-mini` |
+| `ENABLE_UPDATE_SUMMARY` | 可选，`true`/`false`，是否让 LLM 生成变更摘要，默认 true |
+| `NOTIFY_URL` | 判定推送后 POST 的 URL，body 含 `yuque_id`、`title`、`commit`、`update_summary` 等 |
+| **邮件推送** | 全部设置后，判定推送时同时发邮件（与 NOTIFY_URL 可并存） |
+| `SMTP_HOST` | SMTP 服务器地址 |
+| `SMTP_PORT` | 可选，默认 587 |
+| `SMTP_USER` / `SMTP_PASSWORD` | 可选，认证用（也可用 `SMTP_PASS`） |
+| `SMTP_USE_TLS` | 可选，默认 `true` |
+| `EMAIL_FROM` | 发件人地址 |
+| `EMAIL_TO` | 收件人，多个用英文逗号分隔 |
+| `GIT_PUSH_ON_PUSH` | 可选，`true` 时在判定推送后执行 `git push`，默认 false |
+| `DIFF_MAX_CHARS` | 可选，给 LLM 的 diff 最大字符数，默认 6000 |
+| `LLM_TIMEOUT` | 可选，LLM 请求超时秒数，默认 25 |
+| **OpenClaw 模式** | |
+| `OPENCLAW_CALLBACK_URL` | 待判定事件 POST 的 URL；完成后由 OpenClaw 调用本服务 `POST /mark-pushed` |
 | `WEBHOOK_SECRET` | 可选，校验语雀 Webhook 签名 |
 
 ## 使用方式
@@ -71,3 +93,5 @@
 ## 元数据
 
 每篇文档为单文件：**YAML frontmatter**（机读）+ **文档开头 Markdown 表格**（作者、创建时间、更新时间等，人读）+ 正文。frontmatter 含 `yuque_id`、`title`、`slug`、`repo_id`、`repo_slug`、`created_at`、`updated_at`、`user_id`、`last_editor_id`、`author_name` 等，与语雀 get_doc_detail 一致。
+
+输出目录根下另有 **`.yuque-id-to-path.json`**：记录 `yuque_id → 相对路径`，用于文档移动后仍能按「旧路径 vs 新路径」正确算 diff，与 `.yuque-last-push.json` 一起由服务与全量同步维护。

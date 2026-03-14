@@ -59,12 +59,19 @@ def main():
     import asyncio
 
     parser = argparse.ArgumentParser(description="yuque2git TOC sync")
-    parser.add_argument("--output-dir", type=Path, required=True, help="Output Git repo root")
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=os.environ.get("OUTPUT_DIR"),
+        help="文档存储目录（与全量同步/webhook 一致）；也可设环境变量 OUTPUT_DIR",
+    )
     parser.add_argument("--repo-id", type=int, default=None, help="Sync only this repo id")
     args = parser.parse_args()
-    output_dir = args.output_dir.resolve()
+    if not args.output_dir:
+        raise SystemExit("请指定 --output-dir 或设置环境变量 OUTPUT_DIR")
+    output_dir = Path(args.output_dir).resolve()
     if not output_dir.is_dir():
-        raise SystemExit("output-dir must exist")
+        raise SystemExit("output-dir 必须已存在（请先运行全量同步或创建目录）")
     if not YUQUE_TOKEN:
         raise SystemExit("YUQUE_TOKEN required")
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 yuque2git 全量同步：拉取用户知识库列表与 TOC，将 type=DOC 的文档写成 Markdown，按 TOC 层级建目录，写入 .toc.json 与 .repos.json。
+含限流：可配置并发数、请求间隔、429/5xx 重试与退避。
 """
 import argparse
 import asyncio
@@ -19,7 +20,11 @@ logger = logging.getLogger(__name__)
 
 YUQUE_TOKEN = os.environ.get("YUQUE_TOKEN", "")
 YUQUE_BASE_URL = os.environ.get("YUQUE_BASE_URL", "https://nova.yuque.com/api/v2").rstrip("/")
-SEMAPHORE = asyncio.Semaphore(5)
+# 限流与重试
+YUQUE_SYNC_CONCURRENCY = int(os.environ.get("YUQUE_SYNC_CONCURRENCY", "3"))
+YUQUE_SYNC_REQUEST_DELAY = float(os.environ.get("YUQUE_SYNC_REQUEST_DELAY", "0.25"))
+YUQUE_SYNC_MAX_RETRIES = int(os.environ.get("YUQUE_SYNC_MAX_RETRIES", "4"))
+SEMAPHORE = asyncio.Semaphore(YUQUE_SYNC_CONCURRENCY)
 
 
 def _slug_safe(s: str) -> str:
@@ -34,6 +39,44 @@ def _parse_time(ts: Optional[str]) -> Optional[str]:
     return ts.replace("Z", "+00:00") if isinstance(ts, str) else None
 
 
+async def _request_with_retry(
+    client: httpx.AsyncClient,
+    method: str,
+    url: str,
+) -> httpx.Response:
+    """带重试的请求：429、5xx、连接错误时指数退避重试，尊重 Retry-After。"""
+    last_exc = None
+    for attempt in range(YUQUE_SYNC_MAX_RETRIES):
+        try:
+            r = await client.request(method, url)
+            if r.status_code == 429:
+                wait = 2 ** attempt
+                if "Retry-After" in r.headers:
+                    try:
+                        wait = int(r.headers["Retry-After"])
+                    except ValueError:
+                        pass
+                logger.warning("Rate limited (429), retry after %ss (attempt %s/%s)", wait, attempt + 1, YUQUE_SYNC_MAX_RETRIES)
+                await asyncio.sleep(wait)
+                last_exc = httpx.HTTPStatusError("429 Too Many Requests", request=r.request, response=r)
+                continue
+            if 500 <= r.status_code < 600:
+                wait = 2 ** attempt
+                logger.warning("Server error %s, retry after %ss (attempt %s/%s)", r.status_code, wait, attempt + 1, YUQUE_SYNC_MAX_RETRIES)
+                await asyncio.sleep(wait)
+                last_exc = httpx.HTTPStatusError(f"{r.status_code}", request=r.request, response=r)
+                continue
+            return r
+        except (httpx.RequestError, httpx.ConnectTimeout, httpx.ReadTimeout) as e:
+            wait = 2 ** attempt
+            logger.warning("Request error %s, retry after %ss (attempt %s/%s)", e, wait, attempt + 1, YUQUE_SYNC_MAX_RETRIES)
+            await asyncio.sleep(wait)
+            last_exc = e
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Unexpected retry loop exit")
+
+
 class YuqueClient:
     def __init__(self):
         self.headers = {
@@ -42,31 +85,36 @@ class YuqueClient:
             "Content-Type": "application/json",
         }
 
+    async def _get(self, path: str) -> httpx.Response:
+        url = f"{YUQUE_BASE_URL}{path}"
+        async with SEMAPHORE:
+            async with httpx.AsyncClient(headers=self.headers, timeout=30.0) as client:
+                r = await _request_with_retry(client, "GET", url)
+            if YUQUE_SYNC_REQUEST_DELAY > 0:
+                await asyncio.sleep(YUQUE_SYNC_REQUEST_DELAY)
+        return r
+
     async def get_user(self) -> Optional[Dict]:
-        async with httpx.AsyncClient(headers=self.headers, timeout=30.0) as client:
-            r = await client.get(f"{YUQUE_BASE_URL}/user")
-            r.raise_for_status()
-            return r.json().get("data")
+        r = await self._get("/user")
+        r.raise_for_status()
+        return r.json().get("data")
 
     async def get_user_repos(self, user_id: int) -> List[Dict]:
-        async with httpx.AsyncClient(headers=self.headers, timeout=30.0) as client:
-            r = await client.get(f"{YUQUE_BASE_URL}/users/{user_id}/repos")
-            r.raise_for_status()
-            return r.json().get("data", [])
+        r = await self._get(f"/users/{user_id}/repos")
+        r.raise_for_status()
+        return r.json().get("data", [])
 
     async def get_repo_toc(self, repo_id: int) -> List[Dict]:
-        async with httpx.AsyncClient(headers=self.headers, timeout=30.0) as client:
-            r = await client.get(f"{YUQUE_BASE_URL}/repos/{repo_id}/toc")
-            r.raise_for_status()
-            return r.json().get("data", [])
+        r = await self._get(f"/repos/{repo_id}/toc")
+        r.raise_for_status()
+        return r.json().get("data", [])
 
     async def get_doc_detail(self, repo_id: int, slug: str) -> Optional[Dict]:
-        async with httpx.AsyncClient(headers=self.headers, timeout=30.0) as client:
-            r = await client.get(f"{YUQUE_BASE_URL}/repos/{repo_id}/docs/{slug}")
-            if r.status_code == 404:
-                return None
-            r.raise_for_status()
-            return r.json().get("data", {})
+        r = await self._get(f"/repos/{repo_id}/docs/{slug}")
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        return r.json().get("data", {})
 
 
 def _build_md(detail: Dict[str, Any], author_name: str = "") -> str:
@@ -100,6 +148,7 @@ async def _process_toc_item(
     toc_item: Dict,
     parent_path: str,
     toc_by_uuid: Dict[str, Dict],
+    index: Optional[Dict[str, str]] = None,
 ) -> None:
     doc_type = toc_item.get("type", "")
     slug = toc_item.get("url") or toc_item.get("slug") or toc_item.get("uuid", "")
@@ -108,25 +157,26 @@ async def _process_toc_item(
         yuque_id = int(yuque_id)
 
     if doc_type == "DOC" and slug:
-        async with SEMAPHORE:
-            detail = await client.get_doc_detail(repo_id, slug)
-            if not detail:
-                logger.warning("  skip doc (no detail): %s", toc_item.get("title"))
-                return
-            if parent_path:
-                out_file = output_dir / repo_slug / parent_path / (_slug_safe(slug) + ".md")
-            else:
-                out_file = output_dir / repo_slug / (_slug_safe(slug) + ".md")
-            out_file.parent.mkdir(parents=True, exist_ok=True)
-            content = _build_md(detail, "")
-            out_file.write_text(content, encoding="utf-8")
-            logger.info("  wrote %s", out_file.relative_to(output_dir))
+        detail = await client.get_doc_detail(repo_id, slug)
+        if not detail:
+            logger.warning("  skip doc (no detail): %s", toc_item.get("title"))
+            return
+        if parent_path:
+            out_file = output_dir / repo_slug / parent_path / (_slug_safe(slug) + ".md")
+        else:
+            out_file = output_dir / repo_slug / (_slug_safe(slug) + ".md")
+        out_file.parent.mkdir(parents=True, exist_ok=True)
+        content = _build_md(detail, "")
+        out_file.write_text(content, encoding="utf-8")
+        if yuque_id is not None and index is not None:
+            index[str(yuque_id)] = str(out_file.relative_to(output_dir))
+        logger.info("  wrote %s", out_file.relative_to(output_dir))
     elif doc_type == "TITLE" or doc_type == "SHEET":
         seg = _slug_safe(toc_item.get("title") or toc_item.get("uuid", ""))
         next_parent = f"{parent_path}/{seg}" if parent_path else seg
         (output_dir / repo_slug / next_parent).mkdir(parents=True, exist_ok=True)
         for child in toc_list_children(toc_item.get("uuid"), toc_by_uuid):
-            await _process_toc_item(client, repo_id, repo_slug, output_dir, child, next_parent, toc_by_uuid)
+            await _process_toc_item(client, repo_id, repo_slug, output_dir, child, next_parent, toc_by_uuid, index)
 
 
 def toc_list_children(parent_uuid: Optional[str], toc_by_uuid: Dict[str, Dict]) -> List[Dict]:
@@ -137,7 +187,27 @@ def toc_list_children(parent_uuid: Optional[str], toc_by_uuid: Dict[str, Dict]) 
     return out
 
 
-async def sync_repo(client: YuqueClient, repo: Dict, output_dir: Path) -> None:
+def _read_id_to_path_index(output_dir: Path) -> Dict[str, str]:
+    p = output_dir / ".yuque-id-to-path.json"
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _write_id_to_path_index(output_dir: Path, data: Dict[str, str]) -> None:
+    p = output_dir / ".yuque-id-to-path.json"
+    p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+async def sync_repo(
+    client: YuqueClient,
+    repo: Dict,
+    output_dir: Path,
+    index: Optional[Dict[str, str]] = None,
+) -> None:
     repo_id = repo["id"]
     repo_slug = _slug_safe(repo.get("slug", "") or str(repo_id))
     repo_dir = output_dir / repo_slug
@@ -150,7 +220,7 @@ async def sync_repo(client: YuqueClient, repo: Dict, output_dir: Path) -> None:
     toc_by_uuid = {n["uuid"]: n for n in toc_list if n.get("uuid")}
     roots = toc_list_children(None, toc_by_uuid)
     for item in roots:
-        await _process_toc_item(client, repo_id, repo_slug, output_dir, item, "", toc_by_uuid)
+        await _process_toc_item(client, repo_id, repo_slug, output_dir, item, "", toc_by_uuid, index)
 
 
 async def main_async(output_dir: Path, repo_id: Optional[int], mark_all_pushed: bool) -> None:
@@ -176,11 +246,15 @@ async def main_async(output_dir: Path, repo_id: Optional[int], mark_all_pushed: 
     if not (output_dir / ".git").exists():
         subprocess.run(["git", "init"], cwd=output_dir, check=True, capture_output=True)
 
+    index = _read_id_to_path_index(output_dir)
     repos_meta = []
-    for repo in repos:
+    for i, repo in enumerate(repos):
+        if i > 0 and YUQUE_SYNC_REQUEST_DELAY > 0:
+            await asyncio.sleep(YUQUE_SYNC_REQUEST_DELAY * 2)
         repo_slug = _slug_safe(repo.get("slug", "") or str(repo["id"]))
-        await sync_repo(client, repo, output_dir)
+        await sync_repo(client, repo, output_dir, index)
         repos_meta.append({"id": repo["id"], "slug": repo.get("slug"), "name": repo.get("name"), "dir": repo_slug})
+    _write_id_to_path_index(output_dir, index)
 
     (output_dir / ".repos.json").write_text(
         json.dumps(repos_meta, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -203,11 +277,18 @@ async def main_async(output_dir: Path, repo_id: Optional[int], mark_all_pushed: 
 
 def main():
     parser = argparse.ArgumentParser(description="yuque2git full sync")
-    parser.add_argument("--output-dir", type=Path, required=True, help="Output Git repo root")
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=os.environ.get("OUTPUT_DIR"),
+        help="文档存储目录（Git 仓库根），与 webhook 服务一致；也可设环境变量 OUTPUT_DIR",
+    )
     parser.add_argument("--repo-id", type=int, default=None, help="Sync only this repo id")
     parser.add_argument("--mark-all-pushed", action="store_true", help="Set last-push for all docs to current commit")
     args = parser.parse_args()
-    asyncio.run(main_async(args.output_dir.resolve(), args.repo_id, args.mark_all_pushed))
+    if not args.output_dir:
+        parser.error("--output-dir 或环境变量 OUTPUT_DIR 必填")
+    asyncio.run(main_async(Path(args.output_dir).resolve(), args.repo_id, args.mark_all_pushed))
 
 
 if __name__ == "__main__":
