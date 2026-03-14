@@ -27,6 +27,9 @@
 | `YUQUE_SYNC_CONCURRENCY` | 并发请求数，默认 3 |
 | `YUQUE_SYNC_REQUEST_DELAY` | 每次请求成功后的间隔秒数，默认 0.25 |
 | `YUQUE_SYNC_MAX_RETRIES` | 遇 429/5xx 时最大重试次数，默认 4；会按 Retry-After 或指数退避等待 |
+| **TOC 同步**（`sync_toc.py`） | |
+| `YUQUE_TOC_DELAY` | 每个 repo 请求后的间隔秒数，默认 0.3 |
+| `YUQUE_TOC_MAX_RETRIES` | 单次 TOC 请求 429/5xx/网络错误时最大重试次数，默认 3 |
 | `OUTPUT_DIR` | 输出目录（Git 仓库根），与 CLI `--output-dir` 二选一 |
 | `PUSH_DECISION_MODE` | `llm` 或 `openclaw`：推送由本机 LLM 判定，或由 OpenClaw 回调判定 |
 | **LLM 模式** | |
@@ -84,6 +87,12 @@
 
 - 文档删除会立即写入 Git（commit 删除操作），历史可追溯。
 - TOC 信息存于各 repo 的 `.toc.json`，需靠 TOC 同步脚本更新。
+
+## 边界情况：父文档/目录移动
+
+- 当**父文档在语雀 TOC 中被移动**（整棵子树挪到另一节点下）时，若语雀只下发父文档的 webhook，本服务只会更新父文档到新路径；**子文档不会收到事件**，会暂时仍留在旧路径，与语雀结构不一致。
+- 子文档路径会在以下任一情况后恢复一致：语雀对子文档也触发了事件、或执行一次**全量同步**（`sync_to_files.py`）。建议在重要目录移动后跑一次全量同步。
+- 全量同步会按当前 TOC 把父与子都写到新路径，并**根据 .yuque-id-to-path.json 删除已移动文档的旧路径文件**，避免孤儿文件。
 
 ## 智能推送与两种模式
 

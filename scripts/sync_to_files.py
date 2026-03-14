@@ -166,10 +166,18 @@ async def _process_toc_item(
         else:
             out_file = output_dir / repo_slug / (_slug_safe(slug) + ".md")
         out_file.parent.mkdir(parents=True, exist_ok=True)
+        rel_path = str(out_file.relative_to(output_dir))
+        if yuque_id is not None and index is not None:
+            old_path = index.get(str(yuque_id))
+            if old_path and old_path != rel_path:
+                old_full = output_dir / old_path
+                if old_full.exists():
+                    old_full.unlink()
+                    logger.info("  removed old path (move): %s", old_path)
         content = _build_md(detail, "")
         out_file.write_text(content, encoding="utf-8")
         if yuque_id is not None and index is not None:
-            index[str(yuque_id)] = str(out_file.relative_to(output_dir))
+            index[str(yuque_id)] = rel_path
         logger.info("  wrote %s", out_file.relative_to(output_dir))
     elif doc_type == "TITLE" or doc_type == "SHEET":
         seg = _slug_safe(toc_item.get("title") or toc_item.get("uuid", ""))

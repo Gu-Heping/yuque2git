@@ -79,6 +79,16 @@ class TestParentPathFromToc:
         assert path != ""
         assert "目录" in path or "untitled" in path or "u1" in path
 
+    def test_parent_move_in_toc(self):
+        """父文档移动后的 TOC：C 为根，A 在 C 下，B 在 A 下；路径应为 c/a.md、c/a/b.md。"""
+        toc = [
+            {"uuid": "uc", "id": 10, "url": "c", "title": "C", "parent_uuid": None},
+            {"uuid": "ua", "id": 1, "url": "a", "title": "A", "parent_uuid": "uc"},
+            {"uuid": "ub", "id": 2, "url": "b", "title": "B", "parent_uuid": "ua"},
+        ]
+        assert _parent_path_from_toc(toc, 1, "a") == "c"
+        assert _parent_path_from_toc(toc, 2, "b") == "c/a"
+
 
 class TestBuildMd:
     def test_minimal(self):

@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
 yuque2git TOC 同步：遍历已有 repo（从 .repos.json 或 output_dir 子目录），拉取 GET /repos/{id}/toc 写回 .toc.json 并 commit。
+含简单限流：请求间隔与 429/5xx 重试。
 """
 import argparse
+import asyncio
 import json
 import logging
 import os
@@ -17,6 +19,8 @@ logger = logging.getLogger(__name__)
 
 YUQUE_TOKEN = os.environ.get("YUQUE_TOKEN", "")
 YUQUE_BASE_URL = os.environ.get("YUQUE_BASE_URL", "https://nova.yuque.com/api/v2").rstrip("/")
+YUQUE_TOC_DELAY = float(os.environ.get("YUQUE_TOC_DELAY", "0.3"))
+YUQUE_TOC_MAX_RETRIES = int(os.environ.get("YUQUE_TOC_MAX_RETRIES", "3"))
 
 
 def _slug_safe(s: str) -> str:
@@ -42,17 +46,35 @@ def get_repos(output_dir: Path) -> List[dict]:
 
 
 async def fetch_toc(repo_id: int) -> Optional[list]:
-    async with httpx.AsyncClient(
-        headers={
-            "X-Auth-Token": YUQUE_TOKEN,
-            "User-Agent": "yuque2git/1.0",
-        },
-        timeout=30.0,
-    ) as client:
-        r = await client.get(f"{YUQUE_BASE_URL}/repos/{repo_id}/toc")
-        if r.status_code != 200:
-            return None
-        return r.json().get("data", [])
+    headers = {"X-Auth-Token": YUQUE_TOKEN, "User-Agent": "yuque2git/1.0"}
+    last_exc = None
+    for attempt in range(YUQUE_TOC_MAX_RETRIES):
+        try:
+            async with httpx.AsyncClient(headers=headers, timeout=30.0) as client:
+                r = await client.get(f"{YUQUE_BASE_URL}/repos/{repo_id}/toc")
+                if r.status_code == 429:
+                    wait = 2 ** attempt
+                    if "Retry-After" in r.headers:
+                        try:
+                            wait = int(r.headers["Retry-After"])
+                        except ValueError:
+                            pass
+                    logger.warning("TOC 429, retry after %ss", wait)
+                    await asyncio.sleep(wait)
+                    last_exc = None
+                    continue
+                if 500 <= r.status_code < 600:
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                if r.status_code != 200:
+                    return None
+                return r.json().get("data", [])
+        except (httpx.RequestError, httpx.ConnectTimeout, httpx.ReadTimeout) as e:
+            last_exc = e
+            await asyncio.sleep(2 ** attempt)
+    if last_exc:
+        logger.warning("fetch_toc failed after retries: %s", last_exc)
+    return None
 
 
 def main():
@@ -83,7 +105,9 @@ def main():
         return
 
     async def run():
-        for repo in repos:
+        for i, repo in enumerate(repos):
+            if i > 0 and YUQUE_TOC_DELAY > 0:
+                await asyncio.sleep(YUQUE_TOC_DELAY)
             rid = repo.get("id")
             slug = repo.get("slug", "")
             dir_name = repo.get("dir") or _slug_safe(slug or str(rid or ""))

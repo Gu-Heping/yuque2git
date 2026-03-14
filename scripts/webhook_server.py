@@ -582,6 +582,14 @@ async def health():
 async def mark_pushed(body: MarkPushedBody):
     if not OUTPUT_DIR or not OUTPUT_DIR.is_dir():
         return Response(status_code=500, content="OUTPUT_DIR not configured or missing")
+    if body.commit:
+        r = subprocess.run(
+            ["git", "rev-parse", "--verify", body.commit],
+            cwd=OUTPUT_DIR,
+            capture_output=True,
+        )
+        if r.returncode != 0:
+            return Response(status_code=400, content="commit not found in repo")
     data = _read_last_push(OUTPUT_DIR)
     data[str(body.yuque_id)] = body.commit
     _write_last_push(OUTPUT_DIR, data)
@@ -616,8 +624,14 @@ async def webhook(request: Request):
         repo_id = data.book.id
         repo_slug = data.book.slug
         slug = data.slug
+        client = YuqueClient()
+        try:
+            toc_list = await client.get_repo_toc(repo_id)
+        except Exception as e:
+            logger.warning("get_repo_toc failed for repo_id=%s: %s", repo_id, e)
+            return Response(status_code=200, content="ok")  # 避免语雀反复重试
+
         if not slug:
-            toc_list = await YuqueClient().get_repo_toc(repo_id)
             for n in toc_list:
                 if n.get("id") == data.id:
                     slug = n.get("url") or n.get("slug") or ""
@@ -626,12 +640,15 @@ async def webhook(request: Request):
                 logger.warning("Cannot resolve slug for doc id=%s", data.id)
                 return Response(status_code=200, content="ok")
 
-        detail = await YuqueClient().get_doc_detail(repo_id, slug)
+        try:
+            detail = await client.get_doc_detail(repo_id, slug)
+        except Exception as e:
+            logger.warning("get_doc_detail failed for repo=%s slug=%s: %s", repo_id, slug, e)
+            return Response(status_code=200, content="ok")  # 避免语雀反复重试
         if not detail:
             logger.warning("get_doc_detail failed for repo=%s slug=%s", repo_id, slug)
             return Response(status_code=200, content="ok")
 
-        toc_list = await YuqueClient().get_repo_toc(repo_id)
         parent_path = _parent_path_from_toc(toc_list, data.id, slug)
         repo_dir = OUTPUT_DIR / _slug_safe(repo_slug)
         if parent_path:
