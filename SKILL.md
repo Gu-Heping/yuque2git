@@ -1,8 +1,24 @@
+---
+metadata: '{"openclaw":{"requires":{"bins":["python3"],"env":["YUQUE_TOKEN"]},"homepage":"https://github.com/Gu-Heping/yuque2git"}}'
+---
+
 # yuque2git
 
 **Description**：将语雀文档同步到本地文件系统并纳入 Git 版本管理。通过 Webhook 接收 publish/update/delete，把文档写成带 YAML frontmatter 的 Markdown，按 TOC 层级建目录，每次变更自动 commit。支持**智能推送**：由本机 LLM 或 OpenClaw 根据 diff 判定是否推送并生成变更摘要通知订阅者，适合知识库的本地镜像与协作发布。
 
 **触发词**：语雀 webhook、yuque 同步到文件、知识库导出到本地、yuque2git。
+
+---
+
+## 安装（Install）
+
+将本 Skill 安装到 OpenClaw 工作区后，Agent 可按本文档操作语雀同步与智能推送；运行 Webhook 与同步脚本时请使用**本仓库所在目录**（见下方「测试与部署」）。
+
+1. **放入 OpenClaw workspace 的 skills 目录**（二选一）：
+   - **从 GitHub 克隆**：`cd ~/.openclaw/workspace/skills && git clone https://github.com/Gu-Heping/yuque2git.git`
+   - **符号链接**（本机已有仓库时）：`ln -snf /path/to/yuque2git ~/.openclaw/workspace/skills/yuque2git`
+2. **启用**：在 `~/.openclaw/openclaw.json` 的 `skills.entries` 中加入 `"yuque2git": { "enabled": true }`。
+3. **配置与运行**：在**本仓库根目录**配置 `.env`（至少 `YUQUE_TOKEN`、`OUTPUT_DIR`），并从此目录启动 Webhook 服务（见「使用方式」）。不要从 workspace 内克隆副本的目录直接运行服务，以免路径与行为不一致。
 
 ---
 

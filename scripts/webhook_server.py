@@ -311,7 +311,7 @@ def _find_doc_path_by_yuque_id(output_dir: Path, repo_slug: str, yuque_id: int) 
 
 
 def _find_doc_in_dir_by_yuque_id(repo_dir: Path, yuque_id: int) -> Optional[Path]:
-    """在给定目录下按 frontmatter 的 yuque_id 查找 .md 文件。"""
+    """在给定目录下按 frontmatter 的 id/yuque_id 查找 .md 文件。"""
     for md in repo_dir.rglob("*.md"):
         if md.name == ".md":
             continue
@@ -321,7 +321,10 @@ def _find_doc_in_dir_by_yuque_id(repo_dir: Path, yuque_id: int) -> Optional[Path
                 end = raw.index("---", 3) if "---" in raw[3:] else -1
                 if end > 0:
                     fm = yaml.safe_load(raw[3:end])
-                    if fm and fm.get("yuque_id") == yuque_id:
+                    if not fm:
+                        continue
+                    doc_id = fm.get("yuque_id") if fm.get("yuque_id") is not None else fm.get("id")
+                    if doc_id == yuque_id:
                         return md
         except Exception:
             continue
