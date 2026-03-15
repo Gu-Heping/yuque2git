@@ -324,14 +324,50 @@ async def _process_toc_item(
             await _process_toc_item(client, repo_id, repo_dir_name, output_dir, child, next_parent, toc_by_uuid, index, used_bases)
 
 
+def _next_sibling(node: Dict, toc_by_uuid: Dict[str, Dict]) -> Optional[Dict]:
+    """沿 sibling_uuid 取下一个兄弟节点（兼容 child_uuid/sibling_uuid 字段名）。"""
+    uuid = node.get("sibling_uuid") or node.get("siblingUuid")
+    if not uuid:
+        return None
+    return toc_by_uuid.get(uuid)
+
+
 def toc_list_children(parent_uuid: Optional[str], toc_by_uuid: Dict[str, Dict]) -> List[Dict]:
-    out = []
-    for n in toc_by_uuid.values():
-        pu = n.get("parent_uuid")
-        if pu == parent_uuid:
-            out.append(n)
-        elif parent_uuid is None and (pu is None or pu == ""):
-            out.append(n)
+    """返回父节点下的子节点列表。若有 child_uuid/sibling_uuid 链表则按语雀顺序，否则按原逻辑（顺序未保证）。"""
+    out: List[Dict] = []
+    if parent_uuid is None:
+        roots = [n for n in toc_by_uuid.values() if n.get("parent_uuid") in (None, "")]
+        if not roots:
+            return out
+        sibling_targets = {n.get("sibling_uuid") or n.get("siblingUuid") for n in roots if n.get("sibling_uuid") or n.get("siblingUuid")}
+        first_uuid = None
+        for n in roots:
+            u = n.get("uuid")
+            if u and u not in sibling_targets:
+                first_uuid = u
+                break
+        if first_uuid:
+            node = toc_by_uuid.get(first_uuid)
+            while node:
+                out.append(node)
+                node = _next_sibling(node, toc_by_uuid)
+        if len(out) != len(roots):
+            out = roots
+    else:
+        parent = toc_by_uuid.get(parent_uuid)
+        start_uuid = None
+        if parent:
+            start_uuid = parent.get("child_uuid") or parent.get("childUuid")
+        if start_uuid and start_uuid in toc_by_uuid:
+            node = toc_by_uuid[start_uuid]
+            while node:
+                if (node.get("parent_uuid") or node.get("parentUuid")) in (parent_uuid, None):
+                    out.append(node)
+                node = _next_sibling(node, toc_by_uuid)
+        if not out:
+            for n in toc_by_uuid.values():
+                if (n.get("parent_uuid") or n.get("parentUuid")) == parent_uuid:
+                    out.append(n)
     return out
 
 
@@ -350,6 +386,22 @@ def _write_id_to_path_index(output_dir: Path, data: Dict[str, str]) -> None:
     p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _read_last_push(output_dir: Path) -> Dict[str, str]:
+    """与 webhook 同路径、同格式：key=yuque_id(str), value=commit hash。"""
+    p = output_dir / ".yuque-last-push.json"
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _write_last_push(output_dir: Path, data: Dict[str, str]) -> None:
+    p = output_dir / ".yuque-last-push.json"
+    p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 async def sync_repo(
     client: YuqueClient,
     repo: Dict,
@@ -363,6 +415,7 @@ async def sync_repo(
     repo_dir.mkdir(parents=True, exist_ok=True)
 
     toc_list = await client.get_repo_toc(repo_id)
+    logger.info("Syncing repo: %s", repo_dir_name)
     toc_file = repo_dir / ".toc.json"
     toc_file.write_text(json.dumps(toc_list, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -371,6 +424,44 @@ async def sync_repo(
     used_bases: Dict[tuple, set] = {}
     for item in roots:
         await _process_toc_item(client, repo_id, repo_dir_name, output_dir, item, "", toc_by_uuid, index, used_bases)
+
+    # 清理：删除本仓库下不在当前 TOC 中的 .md（语雀已删或移走的孤儿文件）
+    valid_paths = {p for p in (index or {}).values() if p.startswith(repo_dir_name + "/")}
+    last_push = _read_last_push(output_dir)
+    last_push_modified = False
+    for md_file in repo_dir.rglob("*.md"):
+        rel = str(md_file.relative_to(output_dir))
+        if rel not in valid_paths:
+            md_file.unlink()
+            if index is not None:
+                for k in list(index.keys()):
+                    if index.get(k) == rel:
+                        del index[k]
+                        if k in last_push:
+                            del last_push[k]
+                            last_push_modified = True
+                        break
+            logger.info("  removed orphan: %s", rel)
+    if last_push_modified:
+        _write_last_push(output_dir, last_push)
+
+    # 清理仅含 .toc.json 的非法子目录（本脚本只在仓库根写 .toc.json，子目录下仅有 .toc.json 为残留）
+    for _ in range(10):  # 多轮，因子目录删除后父目录可能也变成仅 .toc.json
+        removed_any = False
+        for d in sorted(repo_dir.rglob("*"), key=lambda p: len(p.parts), reverse=True):
+            if not d.is_dir() or d == repo_dir:
+                continue
+            items = list(d.iterdir())
+            if len(items) == 1 and items[0].name == ".toc.json" and items[0].is_file():
+                items[0].unlink()
+                try:
+                    d.rmdir()
+                    logger.info("  removed dir with only .toc.json: %s", d.relative_to(output_dir))
+                    removed_any = True
+                except OSError:
+                    pass
+        if not removed_any:
+            break
 
 
 async def main_async(output_dir: Path, repo_id: Optional[int], mark_all_pushed: bool) -> None:
@@ -411,18 +502,28 @@ async def main_async(output_dir: Path, repo_id: Optional[int], mark_all_pushed: 
     (output_dir / ".repos.json").write_text(
         json.dumps(repos_meta, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    current_dirs = {r["dir"] for r in repos_meta}
+    for d in output_dir.iterdir():
+        if d.name.startswith(".") or not d.is_dir():
+            continue
+        if d.name not in current_dirs:
+            logger.info("Orphan repo dir (not in current API list): %s", d.name)
     subprocess.run(
         ["git", "add", "-A"],
         cwd=output_dir,
         check=True,
         capture_output=True,
     )
-    subprocess.run(
+    commit_ret = subprocess.run(
         ["git", "commit", "-m", "yuque sync: full sync"],
         cwd=output_dir,
         capture_output=True,
+        text=True,
     )
-    logger.info("Full sync done. Repos: %s", [r["slug"] for r in repos_meta])
+    if commit_ret.returncode != 0:
+        msg = (commit_ret.stderr or commit_ret.stdout or "unknown").strip() or "nothing to commit"
+        logger.warning("git commit failed (returncode %s): %s", commit_ret.returncode, msg)
+    logger.info("Full sync done. Repos: %s", [r["dir"] for r in repos_meta])
     if mark_all_pushed:
         logger.info("--mark-all-pushed: TODO update .yuque-last-push.json with current commit")
 

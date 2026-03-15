@@ -9,9 +9,9 @@
 
 ## 快速开始
 
-1. **环境**：项目根目录下  
+1. **环境**：建议始终使用项目虚拟环境，避免依赖冲突。在项目根目录下：  
    `python3.11 -m venv .venv && .venv/bin/pip install -r scripts/requirements.txt`  
-   之后用 `.venv/bin/python` 运行脚本。
+   之后用 `.venv/bin/python` 运行脚本与服务（如 ` .venv/bin/python scripts/sync_to_files.py ...`）。
 2. **输出目录**：环境变量 `OUTPUT_DIR`（如 `export OUTPUT_DIR=/data/yuque-docs`）或参数 `--output-dir /path`。目录不存在时 webhook/全量同步会自动创建。
 3. **必填配置**：`YUQUE_TOKEN`。
 4. **启动 Webhook**：  
@@ -35,6 +35,7 @@
 
 - **模式**：`PUSH_DECISION_MODE=openclaw`，并设置 `OPENCLAW_CALLBACK_URL`（如 `http(s)://<gateway>:<port>/hooks/agent`）、`OPENCLAW_HOOKS_TOKEN`，可选 `YUQUE2GIT_PUBLIC_URL`。
 - **投递目标**：`YUQUE2GIT_DELIVER_CHANNEL=qq`、`YUQUE2GIT_DELIVER_TO=<ID>`。多目标时 `YUQUE2GIT_DELIVER_TO` 可逗号分隔（如 `1179350197,g:1087044655`），或使用 `YUQUE2GIT_DELIVER_TARGETS` JSON 数组；每个目标会单独 POST，两次 POST 间隔由 `YUQUE2GIT_DELIVER_DELAY_SECONDS` 控制（默认 2 秒），避免 rate limit。
+- **429 重试**：若 Gateway/上游返回 429（API rate limit），服务会自动重试（默认最多 3 次、指数退避），可通过环境变量 `YUQUE2GIT_DELIVER_MAX_RETRIES` 调整；仍失败时会在日志中打出 warning。
 - **发给 Agent 的 prompt**：含文档标题、作者、原文地址、本地文件绝对路径（可读以生成概要）；自定义模板见 `YUQUE2GIT_OPENCLAW_MESSAGE_TEMPLATE`，占位符见 [SKILL.md](SKILL.md)。
 - **OpenClaw 侧**：在 `openclaw.json` 启用 hooks，并确保 Agent 能回调 `/mark-pushed`。
 

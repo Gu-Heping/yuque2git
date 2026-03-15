@@ -41,6 +41,8 @@ YUQUE2GIT_DELIVER_TO = os.environ.get("YUQUE2GIT_DELIVER_TO", "").strip()
 YUQUE2GIT_DELIVER_TARGETS_JSON = os.environ.get("YUQUE2GIT_DELIVER_TARGETS", "").strip()
 # 多目标时两次 POST 之间的间隔（秒），避免连续请求触发 Gateway/上游 rate limit，默认 2
 YUQUE2GIT_DELIVER_DELAY_SECONDS = max(0.0, float(os.environ.get("YUQUE2GIT_DELIVER_DELAY_SECONDS", "2.0")))
+# OpenClaw/Gateway 返回 429 时的最大重试次数（每次指数退避），默认 3
+YUQUE2GIT_DELIVER_MAX_RETRIES = max(0, int(os.environ.get("YUQUE2GIT_DELIVER_MAX_RETRIES", "3")))
 YUQUE2GIT_OPENCLAW_MESSAGE_TEMPLATE = os.environ.get("YUQUE2GIT_OPENCLAW_MESSAGE_TEMPLATE", "").strip()
 # 语雀文档原文地址：用于生成 doc_url，未设时从 detail.book.user.login 取
 YUQUE_NAMESPACE = os.environ.get("YUQUE_NAMESPACE", "").strip()
@@ -803,7 +805,8 @@ async def _openclaw_callback(
             deliver_note = ""
             if deliver_targets:
                 deliver_note = (
-                    "你的回复会原样投递到订阅者。若需根据正文生成概要，可先读取上述本地文件再写更新说明（包含文档标题、作者、原文链接、变更要点）；不要只写「已推送」。"
+                    "你的回复会原样投递到订阅者。若决定推送，回复中必须包含更新内容：至少包含文档标题、原文链接、以及根据 diff 提炼的 1～3 句变更要点。禁止只回复「已推送。」——订阅者需要看到具体更新了什么。"
+                    "可先读取上述本地文件再写更新说明。推荐格式示例：【已更新】《文档标题》 原文：<链接> 变更要点：……"
                 )
             else:
                 deliver_note = "若决定推送，可在回复中写「已推送」。"
@@ -853,6 +856,30 @@ async def _openclaw_callback(
         }
         headers = {}
         bodies = [body]
+    async def _post_with_retry(client: httpx.AsyncClient, b: Dict, channel: str, to: str) -> None:
+        last_exc = None
+        for attempt in range(YUQUE2GIT_DELIVER_MAX_RETRIES + 1):
+            r = await client.post(OPENCLAW_CALLBACK_URL, json=b, headers=headers or None)
+            if r.status_code == 429 and attempt < YUQUE2GIT_DELIVER_MAX_RETRIES:
+                wait = 2 ** attempt
+                if "Retry-After" in r.headers:
+                    try:
+                        wait = int(r.headers["Retry-After"])
+                    except ValueError:
+                        pass
+                logger.warning(
+                    "OpenClaw deliver 429 (target %s/%s), retry after %ss (attempt %s/%s)",
+                    channel, to, wait, attempt + 1, YUQUE2GIT_DELIVER_MAX_RETRIES + 1,
+                )
+                await asyncio.sleep(wait)
+                last_exc = httpx.HTTPStatusError("429 Too Many Requests", request=r.request, response=r)
+                continue
+            if r.status_code >= 400:
+                logger.warning("OpenClaw POST target %s/%s returned %s: %s", channel, to, r.status_code, (r.text or "")[:200])
+            return
+        if last_exc:
+            logger.warning("OpenClaw deliver failed after retries: %s", last_exc)
+
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             for i, b in enumerate(bodies):
@@ -862,9 +889,7 @@ async def _openclaw_callback(
                 to = b.get("to", "")
                 if channel or to:
                     logger.info("OpenClaw deliver target %s/%s (request %d/%d)", channel, to, i + 1, len(bodies))
-                r = await client.post(OPENCLAW_CALLBACK_URL, json=b, headers=headers or None)
-                if r.status_code >= 400:
-                    logger.warning("OpenClaw POST target %s/%s returned %s: %s", channel, to, r.status_code, r.text[:200] if r.text else "")
+                await _post_with_retry(client, b, channel, to)
     except Exception as e:
         logger.warning("OpenClaw callback POST failed: %s", e)
 
@@ -991,6 +1016,11 @@ async def webhook(request: Request):
         diff_text = _get_diff(
             OUTPUT_DIR, base_commit, rel_path, yuque_id=data.id, body_only=ENABLE_BODY_ONLY_DIFF
         )
+
+        # 正文无变化时不触发 OpenClaw 分析
+        if diff_text.strip() in ("[无文本变更]", "[文档移动，内容无变更]"):
+            logger.info("Body unchanged, skip push decision (no OpenClaw/LLM)")
+            return Response(status_code=200, content="ok")
 
         if PUSH_DECISION_MODE == "openclaw":
             namespace = (
