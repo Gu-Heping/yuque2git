@@ -32,6 +32,9 @@ PUSH_DECISION_MODE = os.environ.get("PUSH_DECISION_MODE", "llm")  # llm | opencl
 OPENCLAW_CALLBACK_URL = os.environ.get("OPENCLAW_CALLBACK_URL", "").strip() or os.environ.get("PUSH_CALLBACK_URL", "").strip()
 OPENCLAW_HOOKS_TOKEN = os.environ.get("OPENCLAW_HOOKS_TOKEN", "").strip()
 YUQUE2GIT_PUBLIC_URL = os.environ.get("YUQUE2GIT_PUBLIC_URL", "").strip()
+YUQUE2GIT_DELIVER_CHANNEL = os.environ.get("YUQUE2GIT_DELIVER_CHANNEL", "").strip()
+YUQUE2GIT_DELIVER_TO = os.environ.get("YUQUE2GIT_DELIVER_TO", "").strip()
+YUQUE2GIT_OPENCLAW_MESSAGE_TEMPLATE = os.environ.get("YUQUE2GIT_OPENCLAW_MESSAGE_TEMPLATE", "").strip()
 NOTIFY_URL = os.environ.get("NOTIFY_URL", "").strip()
 LAST_PUSH_FILE = ".yuque-last-push.json"  # key: yuque_id (str), value: commit hash
 IDX_FILE = ".yuque-id-to-path.json"  # key: yuque_id (str), value: rel_path，用于文档移动时 diff 查旧路径
@@ -125,8 +128,55 @@ def _slug_safe(s: str) -> str:
     return s.strip() or "untitled"
 
 
+def _doc_basename(title: Optional[str], slug: str) -> str:
+    """文档文件名（不含 .md）：使用标题，无标题时用 slug。"""
+    return _slug_safe(title or slug) or "untitled"
+
+
+def _yuque_id_from_md(file_path: Path) -> Optional[int]:
+    """从已有 .md 的 frontmatter 读取 id/yuque_id，无法解析时返回 None。"""
+    if not file_path.exists() or not file_path.is_file():
+        return None
+    try:
+        text = file_path.read_text(encoding="utf-8")
+        if not text.strip().startswith("---"):
+            return None
+        parts = text.split("---", 2)
+        if len(parts) < 2:
+            return None
+        fm = yaml.safe_load(parts[1])
+        if not fm:
+            return None
+        raw = fm.get("id") or fm.get("yuque_id")
+        if raw is None:
+            return None
+        return int(raw) if isinstance(raw, int) else int(raw) if isinstance(raw, str) and raw.isdigit() else None
+    except Exception:
+        return None
+
+
+def _resolve_doc_basename(parent_dir: Path, base: str, yuque_id: Optional[int]) -> str:
+    """在父目录下解析最终文件名：优先 base.md；若已存在且属其他文档则用 base_2.md、base_3.md 等。"""
+    candidate = base + ".md"
+    path = parent_dir / candidate
+    if not path.exists():
+        return candidate
+    existing_id = _yuque_id_from_md(path)
+    if existing_id == yuque_id:
+        return candidate
+    for i in range(2, 100):
+        candidate = f"{base}_{i}.md"
+        path = parent_dir / candidate
+        if not path.exists():
+            return candidate
+        if _yuque_id_from_md(path) == yuque_id:
+            return candidate
+    return f"{base}_2.md"
+
+
 def _parent_path_from_toc(toc_list: List[Dict], doc_id: int, doc_slug: Optional[str]) -> str:
-    """根据 TOC 和文档 id/slug 得到父路径（用于目录层级），根层返回 ''。"""
+    """根据 TOC 和文档 id/slug 得到父路径（用于目录层级），根层返回 ''。
+    与 sync_to_files 一致：目录段使用 title（便于识别），无 title 时用 uuid。"""
     by_uuid: Dict[str, Dict] = {n["uuid"]: n for n in toc_list if n.get("uuid")}
     by_id: Dict[int, Dict] = {}
     for n in toc_list:
@@ -134,10 +184,8 @@ def _parent_path_from_toc(toc_list: List[Dict], doc_id: int, doc_slug: Optional[
         if i is not None and (isinstance(i, int) or (isinstance(i, str) and i.isdigit())):
             by_id[int(i)] = n
 
-    def slug_or_title(node: Dict) -> str:
-        u = node.get("url") or node.get("slug")
-        if u:
-            return _slug_safe(str(u))
+    def segment_name(node: Dict) -> str:
+        """与 sync_to_files 一致：目录名用 title，无则用 uuid。"""
         return _slug_safe(node.get("title", "") or node.get("uuid", ""))
 
     def ancestors(node: Dict) -> List[Dict]:
@@ -161,13 +209,21 @@ def _parent_path_from_toc(toc_list: List[Dict], doc_id: int, doc_slug: Optional[
     if not target:
         return ""
 
-    parts = [slug_or_title(p) for p in ancestors(target)]
+    parts = [segment_name(p) for p in ancestors(target)]
     return "/".join(parts) if parts else ""
+
+
+# 写入 frontmatter 时排除：正文字段（含 HTML/lake）、嵌套对象，避免内容异常
+_FM_SKIP_KEYS = frozenset({"body", "body_html", "body_draft", "body_lake", "book", "user", "creator"})
 
 
 def _build_md(detail: Dict[str, Any], author_name: str = "") -> str:
     """frontmatter + 元数据表格 + 正文。"""
-    fm = {k: v for k, v in detail.items() if k not in ("body", "body_html") and v is not None}
+    fm = {
+        k: v
+        for k, v in detail.items()
+        if k not in _FM_SKIP_KEYS and v is not None and not isinstance(v, (dict, list))
+    }
     created = detail.get("created_at") or ""
     updated = detail.get("updated_at") or detail.get("content_updated_at") or ""
     if isinstance(created, str) and "T" in created:
@@ -247,10 +303,15 @@ def _write_index(output_dir: Path, data: Dict[str, str]) -> None:
 
 
 def _find_doc_path_by_yuque_id(output_dir: Path, repo_slug: str, yuque_id: int) -> Optional[Path]:
-    """在 repo_slug 下按 frontmatter 的 yuque_id 查找 .md 文件。"""
+    """在 repo_slug 对应目录下按 frontmatter 的 yuque_id 查找 .md 文件。"""
     repo_dir = output_dir / _slug_safe(repo_slug)
     if not repo_dir.is_dir():
         return None
+    return _find_doc_in_dir_by_yuque_id(repo_dir, yuque_id)
+
+
+def _find_doc_in_dir_by_yuque_id(repo_dir: Path, yuque_id: int) -> Optional[Path]:
+    """在给定目录下按 frontmatter 的 yuque_id 查找 .md 文件。"""
     for md in repo_dir.rglob("*.md"):
         if md.name == ".md":
             continue
@@ -264,6 +325,16 @@ def _find_doc_path_by_yuque_id(output_dir: Path, repo_slug: str, yuque_id: int) 
                         return md
         except Exception:
             continue
+    return None
+
+
+def _find_doc_path_by_yuque_id_any_repo(output_dir: Path, yuque_id: int) -> Optional[Path]:
+    """在所有顶层仓库目录下按 yuque_id 查找 .md，与「名称目录」或 slug 目录一致。"""
+    for d in output_dir.iterdir():
+        if d.is_dir() and not d.name.startswith("."):
+            found = _find_doc_in_dir_by_yuque_id(d, yuque_id)
+            if found:
+                return found
     return None
 
 
@@ -567,12 +638,33 @@ async def _openclaw_callback(
             if YUQUE2GIT_PUBLIC_URL
             else "若决定推送，请向部署本 yuque2git 服务的 /mark-pushed 发起 POST，Body JSON 含 yuque_id 与 commit。"
         )
-        message = (
-            f"【yuque2git 推送判定】\n\n"
-            f"文档标题：{title}\n知识库：{repo_name}\n仓库：{repo_slug}\n文档：{doc_slug}\n\n"
-            f"请根据以下 diff 判断是否推送到远程。{callback_instruction}\n\n---\n\nDiff:\n{diff}"
-        )
-        body = {"message": message, "name": "yuque2git", "deliver": False}
+        if YUQUE2GIT_OPENCLAW_MESSAGE_TEMPLATE:
+            message = YUQUE2GIT_OPENCLAW_MESSAGE_TEMPLATE.format(
+                title=title,
+                repo_name=repo_name,
+                repo_slug=repo_slug,
+                doc_slug=doc_slug,
+                diff=diff,
+                yuque_id=yuque_id,
+                commit=commit,
+                callback_instruction=callback_instruction,
+            )
+        else:
+            deliver_note = ""
+            if YUQUE2GIT_DELIVER_CHANNEL and YUQUE2GIT_DELIVER_TO:
+                deliver_note = "你的回复会被投递到上述目标。"
+            message = (
+                f"【yuque2git 推送判定】\n\n"
+                f"文档标题：{title}\n知识库：{repo_name}\n仓库：{repo_slug}\n文档：{doc_slug}\n\n"
+                f"请根据以下 diff 判断是否推送到远程。{callback_instruction} "
+                f"若决定推送，请在回复中写「已推送」；若决定不推送，请在回复中只写 [不发]。"
+                f"{deliver_note}\n\n---\n\nDiff:\n{diff}"
+            )
+        deliver = bool(YUQUE2GIT_DELIVER_CHANNEL and YUQUE2GIT_DELIVER_TO)
+        body = {"message": message, "name": "yuque2git", "deliver": deliver}
+        if deliver:
+            body["channel"] = YUQUE2GIT_DELIVER_CHANNEL
+            body["to"] = YUQUE2GIT_DELIVER_TO
         headers = {}
         if OPENCLAW_HOOKS_TOKEN:
             headers["Authorization"] = f"Bearer {OPENCLAW_HOOKS_TOKEN}"
@@ -651,6 +743,8 @@ async def webhook(request: Request):
 
         repo_id = data.book.id
         repo_slug = data.book.slug
+        # 与全量同步一致：目录名用知识库名称（便于识别）
+        repo_dir_name = _slug_safe(data.book.name or data.book.slug or "")
         slug = data.slug
         client = YuqueClient()
         try:
@@ -678,12 +772,15 @@ async def webhook(request: Request):
             return Response(status_code=200, content="ok")
 
         parent_path = _parent_path_from_toc(toc_list, data.id, slug)
-        repo_dir = OUTPUT_DIR / _slug_safe(repo_slug)
+        repo_dir = OUTPUT_DIR / repo_dir_name
+        base = _doc_basename(detail.get("title"), slug or "")
+        parent_dir = repo_dir / parent_path if parent_path else repo_dir
+        parent_dir.mkdir(parents=True, exist_ok=True)
+        doc_basename = _resolve_doc_basename(parent_dir, base, data.id)
         if parent_path:
-            out_file = repo_dir / parent_path / (_slug_safe(slug) + ".md")
+            out_file = repo_dir / parent_path / doc_basename
         else:
-            out_file = repo_dir / (_slug_safe(slug) + ".md")
-        out_file.parent.mkdir(parents=True, exist_ok=True)
+            out_file = repo_dir / doc_basename
         rel_path = str(out_file.relative_to(OUTPUT_DIR))
         _ensure_git(OUTPUT_DIR)
         index = _read_index(OUTPUT_DIR)
@@ -762,17 +859,8 @@ async def webhook(request: Request):
         return Response(status_code=200, content="ok")
 
     elif action == "delete":
-        repo_slug = (data.book.slug if data.book else None) or ""
-        if repo_slug:
-            doc_path = _find_doc_path_by_yuque_id(OUTPUT_DIR, repo_slug, data.id)
-        else:
-            for d in OUTPUT_DIR.iterdir():
-                if d.is_dir() and not d.name.startswith("."):
-                    doc_path = _find_doc_path_by_yuque_id(OUTPUT_DIR, d.name, data.id)
-                    if doc_path:
-                        break
-            else:
-                doc_path = None
+        # 文档可能写在「知识库名称」或 slug 目录下，统一按 yuque_id 在所有仓库下查找
+        doc_path = _find_doc_path_by_yuque_id_any_repo(OUTPUT_DIR, data.id)
         if doc_path and doc_path.exists():
             rel_del = str(doc_path.relative_to(OUTPUT_DIR))
             doc_path.unlink()

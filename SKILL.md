@@ -56,7 +56,15 @@
 | `OPENCLAW_CALLBACK_URL` | 待判定事件 POST 的 URL。**推荐**填 OpenClaw Gateway 的 Hooks 入口：`http(s)://<gateway>:<port>/hooks/agent`，则走官方 Hooks 协议（message + Bearer） |
 | `OPENCLAW_HOOKS_TOKEN` | 当 URL 为 `/hooks/agent` 时必填，与 `~/.openclaw/openclaw.json` 的 `hooks.token` 一致，用于 `Authorization: Bearer` |
 | `YUQUE2GIT_PUBLIC_URL` | 可选。yuque2git 服务对外可访问的 base URL（如 `http://host:8765`），写入 prompt 供 OpenClaw Agent 回调 `POST /mark-pushed`；未设则 prompt 中为占位说明 |
+| `YUQUE2GIT_DELIVER_CHANNEL` | 可选。与 `YUQUE2GIT_DELIVER_TO` 同时设置时，请求 body 使用 `deliver: true` 并带 channel/to，Agent 回复会投递到该目标；channel 填 OpenClaw 中通道名（如 QQ 为 `qq`） |
+| `YUQUE2GIT_DELIVER_TO` | 可选。投递目标，如 QQ 群 ID 或用户 ID（如 `1179350197`） |
+| `YUQUE2GIT_OPENCLAW_MESSAGE_TEMPLATE` | 可选。自定义发给 Agent 的整段 message；占位符：`{title}`、`{repo_name}`、`{repo_slug}`、`{doc_slug}`、`{diff}`、`{yuque_id}`、`{commit}`、`{callback_instruction}`。若决定不推送，Agent 回复写 `[不发]` 则 QQ 通道不会发送该条 |
 | `WEBHOOK_SECRET` | 可选，校验语雀 Webhook 签名 |
+
+## 测试与部署（主仓库唯一）
+
+- **测试时仅使用本主仓库**：Webhook 服务与全量同步、TOC 同步均应从**本仓库**（即本 Skill 所在目录，如 `/home/admin/yuque2git`）启动，不要从其它副本（如复制到 OpenClaw workspace 的 yuque2git）运行。否则可能出现路径规则不一致（例如仍写 slug 路径）、行为与文档不符。
+- 语雀回调的 Webhook URL 指向的应是基于本主仓库启动的服务。
 
 ## 使用方式
 
@@ -101,7 +109,7 @@
 - **Diff 基准**：以「最后推送时的文档状态」与当前状态做 diff，由 AI 或 OpenClaw 判定是否推送。
 - **LLM 模式**（`PUSH_DECISION_MODE=llm`）：服务内调 LLM 得 YES/NO 与可选更新总结；需配置 `OPENAI_API_KEY` 等。无实质变更（diff 为「无文本变更」或「文档移动内容无变更」）时**不调 LLM**，直接不推送以省 token。默认只对**正文**做 diff（`ENABLE_BODY_ONLY_DIFF=true`），若推送则调用 `NOTIFY_URL` 并更新 last-push。
 - **OpenClaw 模式**（`PUSH_DECISION_MODE=openclaw`）：服务把待判定事件 POST 到 `OPENCLAW_CALLBACK_URL`，由 OpenClaw 判定是否推送；完成后由 Agent 回调本服务 `POST /mark-pushed`（body 含 `yuque_id` 与 `commit`）更新 last-push。
-  - **接入 OpenClaw Gateway Hooks**（推荐）：将 `OPENCLAW_CALLBACK_URL` 设为 `http(s)://<gateway>:<port>/hooks/agent`，并配置 `OPENCLAW_HOOKS_TOKEN`（与 openclaw 的 `hooks.token` 一致）、可选 `YUQUE2GIT_PUBLIC_URL`。在 OpenClaw 侧：于 `~/.openclaw/openclaw.json` 的 `hooks` 下启用对外 Hooks（`hooks.enabled: true`、`hooks.token: "<共享密钥>"`），并确保 main（或目标）Agent 能访问 yuque2git（如允许 `exec` 执行 `curl` 调用 `YUQUE2GIT_PUBLIC_URL/mark-pushed`），网络允许 Gateway 访问 yuque2git 服务。
+  - **接入 OpenClaw Gateway Hooks**（推荐）：将 `OPENCLAW_CALLBACK_URL` 设为 `http(s)://<gateway>:<port>/hooks/agent`，并配置 `OPENCLAW_HOOKS_TOKEN`（与 openclaw 的 `hooks.token` 一致）、可选 `YUQUE2GIT_PUBLIC_URL`。若希望 Agent 的回复投递到 QQ：同时设置 `YUQUE2GIT_DELIVER_CHANNEL=qq` 与 `YUQUE2GIT_DELIVER_TO=<群ID或用户ID>`；默认 prompt 会约定「若决定不推送，回复只写 `[不发]`」，QQ 通道不会发送该条。自定义 prompt 可用 `YUQUE2GIT_OPENCLAW_MESSAGE_TEMPLATE`，占位符见上表。若未配置 deliver channel/to，可在 OpenClaw Agent 的 system prompt 或 AGENTS 中约定：决定推送后由 Agent 用 qqbot 等自行向指定会话发一条通知。在 OpenClaw 侧：于 `~/.openclaw/openclaw.json` 的 `hooks` 下启用对外 Hooks（`hooks.enabled: true`、`hooks.token: "<共享密钥>"`），并确保 main（或目标）Agent 能访问 yuque2git（如允许 `exec` 执行 `curl` 调用 `YUQUE2GIT_PUBLIC_URL/mark-pushed`），网络允许 Gateway 访问 yuque2git 服务。
 
 ## 元数据
 

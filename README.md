@@ -22,7 +22,7 @@
 
 **智能 diff**：推送判定以前一次推送为基准做 diff。输出目录内的 `.yuque-id-to-path.json` 记录每篇文档的路径；文档在语雀中移动父节点导致路径变化时，仍能按「旧路径 vs 新路径」正确算 diff。**Token 优化**：无实质变更时不调 LLM；默认只对正文做 diff（`ENABLE_BODY_ONLY_DIFF=true`），减少 frontmatter 噪音与消耗。
 
-**与 OpenClaw 对接**：若使用 `PUSH_DECISION_MODE=openclaw`，可将 `OPENCLAW_CALLBACK_URL` 设为 OpenClaw Gateway 的 `http(s)://<gateway>:<port>/hooks/agent`，并配置 `OPENCLAW_HOOKS_TOKEN`、可选 `YUQUE2GIT_PUBLIC_URL`；OpenClaw 侧需在 `openclaw.json` 启用 hooks 并确保 Agent 能回调 yuque2git 的 `/mark-pushed`。详见 [SKILL.md](SKILL.md) 的「OpenClaw 模式」与配置表。
+**与 OpenClaw 对接**：若使用 `PUSH_DECISION_MODE=openclaw`，可将 `OPENCLAW_CALLBACK_URL` 设为 OpenClaw Gateway 的 `http(s)://<gateway>:<port>/hooks/agent`，并配置 `OPENCLAW_HOOKS_TOKEN`、可选 `YUQUE2GIT_PUBLIC_URL`。若希望 Agent 回复投递到 QQ，可设置 `YUQUE2GIT_DELIVER_CHANNEL=qq` 与 `YUQUE2GIT_DELIVER_TO=<群ID或用户ID>`；自定义 prompt 可用 `YUQUE2GIT_OPENCLAW_MESSAGE_TEMPLATE`。OpenClaw 侧需在 `openclaw.json` 启用 hooks 并确保 Agent 能回调 yuque2git 的 `/mark-pushed`。详见 [SKILL.md](SKILL.md) 的「OpenClaw 模式」与配置表。
 
 ## 运行测试
 
