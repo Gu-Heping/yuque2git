@@ -34,10 +34,15 @@ OPENCLAW_HOOKS_TOKEN = os.environ.get("OPENCLAW_HOOKS_TOKEN", "").strip()
 YUQUE2GIT_PUBLIC_URL = os.environ.get("YUQUE2GIT_PUBLIC_URL", "").strip()
 YUQUE2GIT_DELIVER_CHANNEL = os.environ.get("YUQUE2GIT_DELIVER_CHANNEL", "").strip()
 YUQUE2GIT_DELIVER_TO = os.environ.get("YUQUE2GIT_DELIVER_TO", "").strip()
+# 多目标：JSON 数组 [{"channel":"qq","to":"id1"},...]；未设时由 CHANNEL+TO 解析（TO 可逗号分隔多个）
+YUQUE2GIT_DELIVER_TARGETS_JSON = os.environ.get("YUQUE2GIT_DELIVER_TARGETS", "").strip()
 YUQUE2GIT_OPENCLAW_MESSAGE_TEMPLATE = os.environ.get("YUQUE2GIT_OPENCLAW_MESSAGE_TEMPLATE", "").strip()
+# 语雀文档原文地址：用于生成 doc_url，未设时从 detail.book.user.login 取
+YUQUE_NAMESPACE = os.environ.get("YUQUE_NAMESPACE", "").strip()
 NOTIFY_URL = os.environ.get("NOTIFY_URL", "").strip()
 LAST_PUSH_FILE = ".yuque-last-push.json"  # key: yuque_id (str), value: commit hash
 IDX_FILE = ".yuque-id-to-path.json"  # key: yuque_id (str), value: rel_path，用于文档移动时 diff 查旧路径
+MEMBERS_FILE = ".yuque-members.json"  # key: user_id (str), value: {"name": "...", "login": "..."}，本地缓存避免重复请求
 # 邮件推送（可选）：SMTP 配置，全部设置后则在判定推送时发邮件
 SMTP_HOST = os.environ.get("SMTP_HOST", "").strip()
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
@@ -116,6 +121,15 @@ class YuqueClient:
     async def get_doc_detail(self, repo_id: int, slug: str) -> Optional[Dict[str, Any]]:
         async with httpx.AsyncClient(headers=self.headers, timeout=30.0) as client:
             r = await client.get(f"{self.base_url}/repos/{repo_id}/docs/{slug}")
+            if r.status_code == 404:
+                return None
+            r.raise_for_status()
+            return r.json().get("data", {})
+
+    async def get_user_by_id(self, user_id: int) -> Optional[Dict[str, Any]]:
+        """GET /users/:id，返回语雀用户信息（含 name/login），用于团队内姓名。"""
+        async with httpx.AsyncClient(headers=self.headers, timeout=15.0) as client:
+            r = await client.get(f"{self.base_url}/users/{user_id}")
             if r.status_code == 404:
                 return None
             r.raise_for_status()
@@ -213,23 +227,78 @@ def _parent_path_from_toc(toc_list: List[Dict], doc_id: int, doc_slug: Optional[
     return "/".join(parts) if parts else ""
 
 
-# 写入 frontmatter 时排除：正文字段（含 HTML/lake）、嵌套对象，避免内容异常
-_FM_SKIP_KEYS = frozenset({"body", "body_html", "body_draft", "body_lake", "book", "user", "creator"})
+# 仅写入 Obsidian 友好 + 同步必需的少量属性，避免冗余（type/body_*/book 嵌套/统计/多时间戳等）
+
+
+def _author_name_from_detail(detail: Dict[str, Any]) -> str:
+    """从文档详情 API 返回的 last_editor / creator / user 中取显示名（webhook 常不带 actor）。"""
+    for key in ("last_editor", "creator", "user"):
+        obj = detail.get(key)
+        if isinstance(obj, dict):
+            name = (obj.get("name") or obj.get("login") or "").strip()
+            if name:
+                return name
+    return ""
+
+
+async def _resolve_author_name(
+    client: "YuqueClient",
+    output_dir: Path,
+    detail: Dict[str, Any],
+    actor_name: str = "",
+) -> str:
+    """解析作者显示名：优先 actor，再 .yuque-members.json（团队内姓名），再 detail 内嵌，缺失时 GET /users/:id。"""
+    if (actor_name or "").strip():
+        return (actor_name or "").strip()
+    user_id = detail.get("last_editor_id") or detail.get("user_id")
+    user_id_str = str(user_id) if user_id else ""
+    members = _read_members(output_dir)
+    if user_id_str and user_id_str in members:
+        return (members[user_id_str].get("name") or members[user_id_str].get("login") or "").strip()
+    name = _author_name_from_detail(detail)
+    if name:
+        return name
+    if not user_id:
+        return ""
+    try:
+        user_data = await client.get_user_by_id(user_id)
+        if user_data:
+            entry = {
+                "name": (user_data.get("name") or "").strip(),
+                "login": (user_data.get("login") or "").strip(),
+            }
+            members[user_id_str] = entry
+            _write_members(output_dir, members)
+            return (entry["name"] or entry["login"] or "").strip()
+    except Exception as e:
+        logger.warning("get_user_by_id %s failed: %s", user_id, e)
+    return ""
 
 
 def _build_md(detail: Dict[str, Any], author_name: str = "") -> str:
-    """frontmatter + 元数据表格 + 正文。"""
-    fm = {
-        k: v
-        for k, v in detail.items()
-        if k not in _FM_SKIP_KEYS and v is not None and not isinstance(v, (dict, list))
-    }
+    """frontmatter（仅允许字段）+ 元数据表格 + 正文。"""
     created = detail.get("created_at") or ""
     updated = detail.get("updated_at") or detail.get("content_updated_at") or ""
     if isinstance(created, str) and "T" in created:
         created = created.replace("Z", "+00:00")[:19].replace("T", " ")
     if isinstance(updated, str) and "T" in updated:
         updated = updated.replace("Z", "+00:00")[:19].replace("T", " ")
+
+    fm = {}
+    for k in ("id", "title", "slug"):
+        if k in detail and detail[k] is not None:
+            fm[k] = detail[k]
+    fm["created_at"] = created
+    fm["updated_at"] = updated
+    if author_name:
+        fm["author"] = author_name
+    book = detail.get("book")
+    if isinstance(book, dict) and (book.get("name") or "").strip():
+        fm["book_name"] = (book.get("name") or "").strip()
+    for k in ("description", "cover"):
+        v = detail.get(k)
+        if v and isinstance(v, str) and v.strip():
+            fm[k] = v.strip()
 
     yaml_block = yaml.dump(fm, allow_unicode=True, default_flow_style=False, sort_keys=False).strip()
     table_cell = (lambda x: x.replace("|", "\\|").replace("\n", " ").strip() if x else "")
@@ -298,6 +367,24 @@ def _read_index(output_dir: Path) -> Dict[str, str]:
 
 def _write_index(output_dir: Path, data: Dict[str, str]) -> None:
     p = output_dir / IDX_FILE
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def _read_members(output_dir: Path) -> Dict[str, Dict[str, str]]:
+    """user_id (str) -> { "name", "login" }"""
+    p = output_dir / MEMBERS_FILE
+    if not p.exists():
+        return {}
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _write_members(output_dir: Path, data: Dict[str, Dict[str, str]]) -> None:
+    p = output_dir / MEMBERS_FILE
     with open(p, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
@@ -615,10 +702,38 @@ async def _send_email_push(
     )
 
 
+def _parse_deliver_targets() -> List[Dict[str, str]]:
+    """解析推送目标列表。支持 YUQUE2GIT_DELIVER_TARGETS JSON 数组，或 CHANNEL+TO（TO 可逗号分隔）。"""
+    if YUQUE2GIT_DELIVER_TARGETS_JSON:
+        try:
+            raw = json.loads(YUQUE2GIT_DELIVER_TARGETS_JSON)
+            if isinstance(raw, list):
+                return [
+                    {"channel": str(t.get("channel", "")).strip(), "to": str(t.get("to", "")).strip()}
+                    for t in raw
+                    if isinstance(t, dict) and (t.get("channel") or "").strip() and (t.get("to") or "").strip()
+                ]
+        except (json.JSONDecodeError, TypeError):
+            pass
+    ch = (YUQUE2GIT_DELIVER_CHANNEL or "").strip()
+    to_raw = (YUQUE2GIT_DELIVER_TO or "").strip()
+    if not ch or not to_raw:
+        return []
+    return [{"channel": ch, "to": t.strip()} for t in to_raw.split(",") if t.strip()]
+
+
 def _is_openclaw_hooks_agent_url(url: str) -> bool:
     """是否指向 OpenClaw Gateway 的 /hooks/agent 入口。"""
     u = (url or "").rstrip("/")
     return u.endswith("/hooks/agent")
+
+
+def _doc_url(namespace: str, repo_slug: str, doc_slug: str) -> str:
+    """语雀文档原文地址。base 从 YUQUE_BASE_URL 推导（如 nova.yuque.com）。"""
+    base = YUQUE_BASE_URL.replace("/api/v2", "").rstrip("/") or "https://nova.yuque.com"
+    if not namespace or not repo_slug or not doc_slug:
+        return ""
+    return f"{base}/{namespace}/{repo_slug}/{doc_slug}"
 
 
 async def _openclaw_callback(
@@ -629,6 +744,8 @@ async def _openclaw_callback(
     repo_name: str,
     diff: str,
     commit: str,
+    author_name: str = "",
+    doc_url: str = "",
 ) -> None:
     """将「待判定」事件 POST 到 OpenClaw，由对方决定是否推送并回调 /mark-pushed。"""
     if not OPENCLAW_CALLBACK_URL:
@@ -651,23 +768,36 @@ async def _openclaw_callback(
                 yuque_id=yuque_id,
                 commit=commit,
                 callback_instruction=callback_instruction,
+                author=author_name,
+                doc_url=doc_url,
             )
         else:
+            deliver_targets = _parse_deliver_targets()
             deliver_note = ""
-            if YUQUE2GIT_DELIVER_CHANNEL and YUQUE2GIT_DELIVER_TO:
-                deliver_note = "你的回复会被投递到上述目标。"
+            if deliver_targets:
+                deliver_note = (
+                    "你的回复会原样投递到订阅者。请写一句简短的更新说明，包含：文档标题、作者、原文链接、变更要点；不要只写「已推送」。"
+                )
+            else:
+                deliver_note = "若决定推送，可在回复中写「已推送」。"
+            author_line = f"作者：{author_name}\n" if author_name else ""
+            doc_url_line = f"原文地址：{doc_url}\n" if doc_url else ""
             message = (
                 f"【yuque2git 推送判定】\n\n"
-                f"文档标题：{title}\n知识库：{repo_name}\n仓库：{repo_slug}\n文档：{doc_slug}\n\n"
+                f"文档标题：{title}\n知识库：{repo_name}\n仓库：{repo_slug}\n文档：{doc_slug}\n"
+                f"{author_line}{doc_url_line}\n"
                 f"请根据以下 diff 判断是否推送到远程。{callback_instruction} "
-                f"若决定推送，请在回复中写「已推送」；若决定不推送，请在回复中只写 [不发]。"
+                f"若决定不推送，请在回复中只写 [不发]。"
                 f"{deliver_note}\n\n---\n\nDiff:\n{diff}"
             )
-        deliver = bool(YUQUE2GIT_DELIVER_CHANNEL and YUQUE2GIT_DELIVER_TO)
+        deliver_targets = _parse_deliver_targets()
+        deliver = bool(deliver_targets)
         body = {"message": message, "name": "yuque2git", "deliver": deliver}
         if deliver:
-            body["channel"] = YUQUE2GIT_DELIVER_CHANNEL
-            body["to"] = YUQUE2GIT_DELIVER_TO
+            body["channel"] = deliver_targets[0]["channel"]
+            body["to"] = deliver_targets[0]["to"]
+            if len(deliver_targets) > 1:
+                body["deliver_to"] = deliver_targets
         headers = {}
         if OPENCLAW_HOOKS_TOKEN:
             headers["Authorization"] = f"Bearer {OPENCLAW_HOOKS_TOKEN}"
@@ -793,7 +923,9 @@ async def webhook(request: Request):
             if old_full.exists():
                 old_full.unlink()
                 _git_add_commit(OUTPUT_DIR, [old_path], f"yuque: remove old path (move) id={data.id}")
-        author_name = (data.actor.name if data.actor else "") or ""
+        author_name = await _resolve_author_name(
+            client, OUTPUT_DIR, detail, (data.actor.name if data.actor else "")
+        )
         content = _build_md(detail, author_name)
         out_file.write_text(content, encoding="utf-8")
         index[str(data.id)] = rel_path
@@ -814,6 +946,10 @@ async def webhook(request: Request):
         )
 
         if PUSH_DECISION_MODE == "openclaw":
+            namespace = (
+                (detail.get("book") or {}).get("user") or {}
+            ).get("login") or YUQUE_NAMESPACE
+            doc_link = _doc_url(namespace, repo_slug, slug or "") if (repo_slug and slug) else ""
             await _openclaw_callback(
                 yuque_id=data.id,
                 repo_slug=repo_slug,
@@ -822,6 +958,8 @@ async def webhook(request: Request):
                 repo_name=data.book.name or "",
                 diff=diff_text,
                 commit=commit_hash or "",
+                author_name=author_name,
+                doc_url=doc_link,
             )
             return Response(status_code=200, content="ok")
 

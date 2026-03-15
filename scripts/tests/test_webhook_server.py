@@ -60,7 +60,7 @@ class TestParentPathFromToc:
             {"uuid": "u1", "id": 1, "url": "parent", "title": "Parent", "parent_uuid": None},
             {"uuid": "u2", "id": 2, "url": "child", "title": "Child", "parent_uuid": "u1"},
         ]
-        assert _parent_path_from_toc(toc, 2, "child") == "parent"
+        assert _parent_path_from_toc(toc, 2, "child") == "Parent"
         assert _parent_path_from_toc(toc, 1, "parent") == ""
 
     def test_nested(self):
@@ -69,7 +69,7 @@ class TestParentPathFromToc:
             {"uuid": "u2", "id": 2, "url": "b", "title": "B", "parent_uuid": "u1"},
             {"uuid": "u3", "id": 3, "url": "c", "title": "C", "parent_uuid": "u2"},
         ]
-        assert _parent_path_from_toc(toc, 3, "c") == "a/b"
+        assert _parent_path_from_toc(toc, 3, "c") == "A/B"
 
     def test_title_no_url(self):
         toc = [
@@ -81,14 +81,14 @@ class TestParentPathFromToc:
         assert "目录" in path or "untitled" in path or "u1" in path
 
     def test_parent_move_in_toc(self):
-        """父文档移动后的 TOC：C 为根，A 在 C 下，B 在 A 下；路径应为 c/a.md、c/a/b.md。"""
+        """父文档移动后的 TOC：C 为根，A 在 C 下，B 在 A 下；路径应为 C/A.md、C/A/B.md（目录段用 title）。"""
         toc = [
             {"uuid": "uc", "id": 10, "url": "c", "title": "C", "parent_uuid": None},
             {"uuid": "ua", "id": 1, "url": "a", "title": "A", "parent_uuid": "uc"},
             {"uuid": "ub", "id": 2, "url": "b", "title": "B", "parent_uuid": "ua"},
         ]
-        assert _parent_path_from_toc(toc, 1, "a") == "c"
-        assert _parent_path_from_toc(toc, 2, "b") == "c/a"
+        assert _parent_path_from_toc(toc, 1, "a") == "C"
+        assert _parent_path_from_toc(toc, 2, "b") == "C/A"
 
 
 class TestBuildMd:

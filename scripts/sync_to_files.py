@@ -33,52 +33,6 @@ def _slug_safe(s: str) -> str:
     return s.strip() or "untitled"
 
 
-def _doc_basename(title: Optional[str], slug: str) -> str:
-    """文档文件名（不含 .md）：使用标题，无标题时用 slug。"""
-    return _slug_safe(title or slug) or "untitled"
-
-
-def _yuque_id_from_md(file_path: Path) -> Optional[int]:
-    """从已有 .md 的 frontmatter 读取 id/yuque_id，无法解析时返回 None。"""
-    if not file_path.exists() or not file_path.is_file():
-        return None
-    try:
-        text = file_path.read_text(encoding="utf-8")
-        if not text.strip().startswith("---"):
-            return None
-        parts = text.split("---", 2)
-        if len(parts) < 2:
-            return None
-        fm = yaml.safe_load(parts[1])
-        if not fm:
-            return None
-        raw = fm.get("id") or fm.get("yuque_id")
-        if raw is None:
-            return None
-        return int(raw) if isinstance(raw, int) else int(raw) if isinstance(raw, str) and raw.isdigit() else None
-    except Exception:
-        return None
-
-
-def _resolve_doc_basename(parent_dir: Path, base: str, yuque_id: Optional[int]) -> str:
-    """在父目录下解析最终文件名：优先 base.md；若已存在且属其他文档则用 base_2.md、base_3.md 等。"""
-    candidate = base + ".md"
-    path = parent_dir / candidate
-    if not path.exists():
-        return candidate
-    existing_id = _yuque_id_from_md(path)
-    if existing_id == yuque_id:
-        return candidate
-    for i in range(2, 100):
-        candidate = f"{base}_{i}.md"
-        path = parent_dir / candidate
-        if not path.exists():
-            return candidate
-        if _yuque_id_from_md(path) == yuque_id:
-            return candidate
-    return f"{base}_2.md"
-
-
 def _parse_time(ts: Optional[str]) -> Optional[str]:
     if not ts:
         return None
@@ -163,16 +117,8 @@ class YuqueClient:
         return r.json().get("data", {})
 
 
-# 写入 frontmatter 时排除：正文字段（含 HTML/lake）、嵌套对象，避免内容异常
-_FM_SKIP_KEYS = frozenset({"body", "body_html", "body_draft", "body_lake", "book", "user", "creator"})
-
-
 def _build_md(detail: Dict[str, Any], author_name: str = "") -> str:
-    fm = {
-        k: v
-        for k, v in detail.items()
-        if k not in _FM_SKIP_KEYS and v is not None and not isinstance(v, (dict, list))
-    }
+    fm = {k: v for k, v in detail.items() if k not in ("body", "body_html") and v is not None}
     created = detail.get("created_at") or ""
     updated = detail.get("updated_at") or detail.get("content_updated_at") or ""
     if isinstance(created, str) and "T" in created:
@@ -215,14 +161,11 @@ async def _process_toc_item(
         if not detail:
             logger.warning("  skip doc (no detail): %s", toc_item.get("title"))
             return
-        base = _doc_basename(detail.get("title"), slug)
-        parent_dir = output_dir / repo_slug / parent_path if parent_path else output_dir / repo_slug
-        parent_dir.mkdir(parents=True, exist_ok=True)
-        doc_basename = _resolve_doc_basename(parent_dir, base, yuque_id)
         if parent_path:
-            out_file = output_dir / repo_slug / parent_path / doc_basename
+            out_file = output_dir / repo_slug / parent_path / (_slug_safe(slug) + ".md")
         else:
-            out_file = output_dir / repo_slug / doc_basename
+            out_file = output_dir / repo_slug / (_slug_safe(slug) + ".md")
+        out_file.parent.mkdir(parents=True, exist_ok=True)
         rel_path = str(out_file.relative_to(output_dir))
         if yuque_id is not None and index is not None:
             old_path = index.get(str(yuque_id))
@@ -277,8 +220,7 @@ async def sync_repo(
     index: Optional[Dict[str, str]] = None,
 ) -> None:
     repo_id = repo["id"]
-    # 使用知识库名称作为目录名，便于识别；无 name 时回退为 slug 或 id
-    repo_slug = _slug_safe(repo.get("name") or repo.get("slug", "") or str(repo_id))
+    repo_slug = _slug_safe(repo.get("slug", "") or str(repo_id))
     repo_dir = output_dir / repo_slug
     repo_dir.mkdir(parents=True, exist_ok=True)
 
@@ -320,7 +262,7 @@ async def main_async(output_dir: Path, repo_id: Optional[int], mark_all_pushed: 
     for i, repo in enumerate(repos):
         if i > 0 and YUQUE_SYNC_REQUEST_DELAY > 0:
             await asyncio.sleep(YUQUE_SYNC_REQUEST_DELAY * 2)
-        repo_slug = _slug_safe(repo.get("name") or repo.get("slug", "") or str(repo["id"]))
+        repo_slug = _slug_safe(repo.get("slug", "") or str(repo["id"]))
         await sync_repo(client, repo, output_dir, index)
         repos_meta.append({"id": repo["id"], "slug": repo.get("slug"), "name": repo.get("name"), "dir": repo_slug})
     _write_id_to_path_index(output_dir, index)

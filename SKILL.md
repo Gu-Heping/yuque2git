@@ -72,9 +72,11 @@ metadata: '{"openclaw":{"requires":{"bins":["python3"],"env":["YUQUE_TOKEN"]},"h
 | `OPENCLAW_CALLBACK_URL` | 待判定事件 POST 的 URL。**推荐**填 OpenClaw Gateway 的 Hooks 入口：`http(s)://<gateway>:<port>/hooks/agent`，则走官方 Hooks 协议（message + Bearer） |
 | `OPENCLAW_HOOKS_TOKEN` | 当 URL 为 `/hooks/agent` 时必填，与 `~/.openclaw/openclaw.json` 的 `hooks.token` 一致，用于 `Authorization: Bearer` |
 | `YUQUE2GIT_PUBLIC_URL` | 可选。yuque2git 服务对外可访问的 base URL（如 `http://host:8765`），写入 prompt 供 OpenClaw Agent 回调 `POST /mark-pushed`；未设则 prompt 中为占位说明 |
-| `YUQUE2GIT_DELIVER_CHANNEL` | 可选。与 `YUQUE2GIT_DELIVER_TO` 同时设置时，请求 body 使用 `deliver: true` 并带 channel/to，Agent 回复会投递到该目标；channel 填 OpenClaw 中通道名（如 QQ 为 `qq`） |
-| `YUQUE2GIT_DELIVER_TO` | 可选。投递目标，如 QQ 群 ID 或用户 ID（如 `1179350197`） |
-| `YUQUE2GIT_OPENCLAW_MESSAGE_TEMPLATE` | 可选。自定义发给 Agent 的整段 message；占位符：`{title}`、`{repo_name}`、`{repo_slug}`、`{doc_slug}`、`{diff}`、`{yuque_id}`、`{commit}`、`{callback_instruction}`。若决定不推送，Agent 回复写 `[不发]` 则 QQ 通道不会发送该条 |
+| `YUQUE2GIT_DELIVER_CHANNEL` | 可选。与 `YUQUE2GIT_DELIVER_TO` 同时设置时，请求 body 使用 `deliver: true` 并带 channel/to；channel 填 OpenClaw 中通道名（如 `qq`） |
+| `YUQUE2GIT_DELIVER_TO` | 可选。投递目标，支持**多选**：逗号分隔多个 ID（如 `1179350197,群ID2`），同一 channel 下会收到同一条回复 |
+| `YUQUE2GIT_DELIVER_TARGETS` | 可选。多目标 JSON 数组，覆盖 CHANNEL+TO。例：`[{"channel":"qq","to":"1179350197"},{"channel":"qq","to":"456"}]`。请求中会带 `deliver_to` 数组；若 Gateway 支持多目标投递，会向每项各发一条 |
+| `YUQUE2GIT_OPENCLAW_MESSAGE_TEMPLATE` | 可选。自定义发给 Agent 的整段 message；占位符：`{title}`、`{repo_name}`、`{repo_slug}`、`{doc_slug}`、`{diff}`、`{yuque_id}`、`{commit}`、`{callback_instruction}`、`{author}`、`{doc_url}`。若决定不推送，Agent 回复写 `[不发]` 则 QQ 通道不会发送该条 |
+| `YUQUE_NAMESPACE` | 可选。语雀命名空间（团队/用户 login），用于生成原文地址；未设时从文档详情的 book.user.login 取 |
 | `WEBHOOK_SECRET` | 可选，校验语雀 Webhook 签名 |
 
 ## 测试与部署（主仓库唯一）
