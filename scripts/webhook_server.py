@@ -746,11 +746,14 @@ async def _openclaw_callback(
     commit: str,
     author_name: str = "",
     doc_url: str = "",
+    local_path: str = "",
 ) -> None:
     """将「待判定」事件 POST 到 OpenClaw，由对方决定是否推送并回调 /mark-pushed。"""
     if not OPENCLAW_CALLBACK_URL:
         logger.warning("OPENCLAW_CALLBACK_URL not set")
         return
+    # 供 Agent 直接读取的本地绝对路径（与 OUTPUT_DIR 同机时可用 read 工具）
+    local_path_abs = str(OUTPUT_DIR / local_path) if (OUTPUT_DIR and local_path) else local_path
     if _is_openclaw_hooks_agent_url(OPENCLAW_CALLBACK_URL):
         callback_instruction = (
             f"若决定推送，请向以下 URL 发送 POST 请求：{YUQUE2GIT_PUBLIC_URL.rstrip('/')}/mark-pushed，"
@@ -770,39 +773,50 @@ async def _openclaw_callback(
                 callback_instruction=callback_instruction,
                 author=author_name,
                 doc_url=doc_url,
+                local_path=local_path_abs or local_path,
             )
         else:
             deliver_targets = _parse_deliver_targets()
             deliver_note = ""
             if deliver_targets:
                 deliver_note = (
-                    "你的回复会原样投递到订阅者。请写一句简短的更新说明，包含：文档标题、作者、原文链接、变更要点；不要只写「已推送」。"
+                    "你的回复会原样投递到订阅者。若需根据正文生成概要，可先读取上述本地文件再写更新说明（包含文档标题、作者、原文链接、变更要点）；不要只写「已推送」。"
                 )
             else:
                 deliver_note = "若决定推送，可在回复中写「已推送」。"
             author_line = f"作者：{author_name}\n" if author_name else ""
             doc_url_line = f"原文地址：{doc_url}\n" if doc_url else ""
+            local_path_line = ""
+            if local_path_abs:
+                local_path_line = f"本地文件（可直接读取以生成概要）：{local_path_abs}\n"
             message = (
                 f"【yuque2git 推送判定】\n\n"
                 f"文档标题：{title}\n知识库：{repo_name}\n仓库：{repo_slug}\n文档：{doc_slug}\n"
-                f"{author_line}{doc_url_line}\n"
+                f"{author_line}{doc_url_line}{local_path_line}\n"
                 f"请根据以下 diff 判断是否推送到远程。{callback_instruction} "
                 f"若决定不推送，请在回复中只写 [不发]。"
                 f"{deliver_note}\n\n---\n\nDiff:\n{diff}"
             )
         deliver_targets = _parse_deliver_targets()
         deliver = bool(deliver_targets)
-        body = {"message": message, "name": "yuque2git", "deliver": deliver}
-        if deliver:
-            body["channel"] = deliver_targets[0]["channel"]
-            body["to"] = deliver_targets[0]["to"]
-            if len(deliver_targets) > 1:
-                body["deliver_to"] = deliver_targets
         headers = {}
         if OPENCLAW_HOOKS_TOKEN:
             headers["Authorization"] = f"Bearer {OPENCLAW_HOOKS_TOKEN}"
         else:
             logger.warning("OPENCLAW_HOOKS_TOKEN not set, Gateway may return 401")
+        # Gateway 通常只按单组 channel/to 投递，多目标时对每个目标各发一次 POST，确保群和私聊都能收到
+        if deliver and deliver_targets:
+            bodies = [
+                {"message": message, "name": "yuque2git", "deliver": True, "channel": t["channel"], "to": t["to"]}
+                for t in deliver_targets
+            ]
+        else:
+            bodies = [
+                {"message": message, "name": "yuque2git", "deliver": deliver and bool(deliver_targets)}
+            ]
+            if deliver_targets:
+                bodies[0]["channel"] = deliver_targets[0]["channel"]
+                bodies[0]["to"] = deliver_targets[0]["to"]
     else:
         body = {
             "yuque_id": yuque_id,
@@ -815,9 +829,11 @@ async def _openclaw_callback(
             "action": "should_push",
         }
         headers = {}
+        bodies = [body]
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
-            await client.post(OPENCLAW_CALLBACK_URL, json=body, headers=headers or None)
+            for b in bodies:
+                await client.post(OPENCLAW_CALLBACK_URL, json=b, headers=headers or None)
     except Exception as e:
         logger.warning("OpenClaw callback POST failed: %s", e)
 
@@ -960,6 +976,7 @@ async def webhook(request: Request):
                 commit=commit_hash or "",
                 author_name=author_name,
                 doc_url=doc_link,
+                local_path=rel_path,
             )
             return Response(status_code=200, content="ok")
 
