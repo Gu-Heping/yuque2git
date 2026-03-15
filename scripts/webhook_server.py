@@ -8,12 +8,15 @@ import difflib
 import json
 import logging
 import os
+import re
 import smtplib
 import subprocess
+from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 import httpx
 import uvicorn
@@ -36,9 +39,13 @@ YUQUE2GIT_DELIVER_CHANNEL = os.environ.get("YUQUE2GIT_DELIVER_CHANNEL", "").stri
 YUQUE2GIT_DELIVER_TO = os.environ.get("YUQUE2GIT_DELIVER_TO", "").strip()
 # 多目标：JSON 数组 [{"channel":"qq","to":"id1"},...]；未设时由 CHANNEL+TO 解析（TO 可逗号分隔多个）
 YUQUE2GIT_DELIVER_TARGETS_JSON = os.environ.get("YUQUE2GIT_DELIVER_TARGETS", "").strip()
+# 多目标时两次 POST 之间的间隔（秒），避免连续请求触发 Gateway/上游 rate limit，默认 2
+YUQUE2GIT_DELIVER_DELAY_SECONDS = max(0.0, float(os.environ.get("YUQUE2GIT_DELIVER_DELAY_SECONDS", "2.0")))
 YUQUE2GIT_OPENCLAW_MESSAGE_TEMPLATE = os.environ.get("YUQUE2GIT_OPENCLAW_MESSAGE_TEMPLATE", "").strip()
 # 语雀文档原文地址：用于生成 doc_url，未设时从 detail.book.user.login 取
 YUQUE_NAMESPACE = os.environ.get("YUQUE_NAMESPACE", "").strip()
+# 元数据时间转为本地可读：YUQUE_TIMEZONE（如 Asia/Shanghai），未设默认 Asia/Shanghai
+YUQUE_TIMEZONE = os.environ.get("YUQUE_TIMEZONE", "Asia/Shanghai").strip() or "Asia/Shanghai"
 NOTIFY_URL = os.environ.get("NOTIFY_URL", "").strip()
 LAST_PUSH_FILE = ".yuque-last-push.json"  # key: yuque_id (str), value: commit hash
 IDX_FILE = ".yuque-id-to-path.json"  # key: yuque_id (str), value: rel_path，用于文档移动时 diff 查旧路径
@@ -275,14 +282,30 @@ async def _resolve_author_name(
     return ""
 
 
+def _normalize_ts_local(ts: Optional[str]) -> str:
+    """语雀返回 UTC，转为本地可读时间 YYYY-MM-DD HH:MM:SS（时区见 YUQUE_TIMEZONE）。"""
+    if not ts or not isinstance(ts, str):
+        return str(ts) if ts else ""
+    t = ts.strip().replace("Z", "+00:00")
+    if "T" not in t:
+        return t
+    t = re.sub(r"\.\d+", "", t)
+    if not re.search(r"[+-]\d{2}:\d{2}$", t):
+        t = t + "+00:00"
+    try:
+        dt = datetime.fromisoformat(t)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        local = dt.astimezone(ZoneInfo(YUQUE_TIMEZONE))
+        return local.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return t
+
+
 def _build_md(detail: Dict[str, Any], author_name: str = "") -> str:
     """frontmatter（仅允许字段）+ 元数据表格 + 正文。"""
-    created = detail.get("created_at") or ""
-    updated = detail.get("updated_at") or detail.get("content_updated_at") or ""
-    if isinstance(created, str) and "T" in created:
-        created = created.replace("Z", "+00:00")[:19].replace("T", " ")
-    if isinstance(updated, str) and "T" in updated:
-        updated = updated.replace("Z", "+00:00")[:19].replace("T", " ")
+    created = _normalize_ts_local(detail.get("created_at") or "")
+    updated = _normalize_ts_local(detail.get("updated_at") or detail.get("content_updated_at") or "")
 
     fm = {}
     for k in ("id", "title", "slug"):
@@ -832,8 +855,16 @@ async def _openclaw_callback(
         bodies = [body]
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
-            for b in bodies:
-                await client.post(OPENCLAW_CALLBACK_URL, json=b, headers=headers or None)
+            for i, b in enumerate(bodies):
+                if i > 0 and YUQUE2GIT_DELIVER_DELAY_SECONDS > 0 and len(bodies) > 1:
+                    await asyncio.sleep(YUQUE2GIT_DELIVER_DELAY_SECONDS)
+                channel = b.get("channel", "")
+                to = b.get("to", "")
+                if channel or to:
+                    logger.info("OpenClaw deliver target %s/%s (request %d/%d)", channel, to, i + 1, len(bodies))
+                r = await client.post(OPENCLAW_CALLBACK_URL, json=b, headers=headers or None)
+                if r.status_code >= 400:
+                    logger.warning("OpenClaw POST target %s/%s returned %s: %s", channel, to, r.status_code, r.text[:200] if r.text else "")
     except Exception as e:
         logger.warning("OpenClaw callback POST failed: %s", e)
 

@@ -8,9 +8,12 @@ import asyncio
 import json
 import logging
 import os
+import re
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 import httpx
 import yaml
@@ -20,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 YUQUE_TOKEN = os.environ.get("YUQUE_TOKEN", "")
 YUQUE_BASE_URL = os.environ.get("YUQUE_BASE_URL", "https://nova.yuque.com/api/v2").rstrip("/")
+YUQUE_TIMEZONE = (os.environ.get("YUQUE_TIMEZONE", "Asia/Shanghai") or "Asia/Shanghai").strip()
 # 限流与重试
 YUQUE_SYNC_CONCURRENCY = int(os.environ.get("YUQUE_SYNC_CONCURRENCY", "3"))
 YUQUE_SYNC_REQUEST_DELAY = float(os.environ.get("YUQUE_SYNC_REQUEST_DELAY", "0.25"))
@@ -33,10 +37,63 @@ def _slug_safe(s: str) -> str:
     return s.strip() or "untitled"
 
 
+def _doc_basename(title: Optional[str], slug: str) -> str:
+    """与 webhook 一致：文档文件名用标题，无标题时用 slug。"""
+    return _slug_safe(title or slug) or "untitled"
+
+
 def _parse_time(ts: Optional[str]) -> Optional[str]:
     if not ts:
         return None
     return ts.replace("Z", "+00:00") if isinstance(ts, str) else None
+
+
+def _normalize_ts_local(ts: Optional[str]) -> str:
+    """语雀返回 UTC，转为本地可读时间 YYYY-MM-DD HH:MM:SS（时区见 YUQUE_TIMEZONE）。"""
+    if not ts or not isinstance(ts, str):
+        return str(ts) if ts else ""
+    t = ts.strip().replace("Z", "+00:00")
+    if "T" not in t:
+        return t
+    t = re.sub(r"\.\d+", "", t)
+    if not re.search(r"[+-]\d{2}:\d{2}$", t):
+        t = t + "+00:00"
+    try:
+        dt = datetime.fromisoformat(t)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        local = dt.astimezone(ZoneInfo(YUQUE_TIMEZONE))
+        return local.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return t
+
+
+def _author_name_from_detail(detail: Dict[str, Any]) -> str:
+    """从文档详情的 last_editor / creator / user 中取显示名。"""
+    for key in ("last_editor", "creator", "user"):
+        obj = detail.get(key)
+        if isinstance(obj, dict):
+            name = (obj.get("name") or obj.get("login") or "").strip()
+            if name:
+                return name
+    return ""
+
+
+def _read_members(output_dir: Path) -> Dict[str, Dict[str, str]]:
+    """读取 .yuque-members.json，全量同步时优先用团队内姓名。"""
+    p = output_dir / ".yuque-members.json"
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _write_members(output_dir: Path, data: Dict[str, Dict[str, str]]) -> None:
+    """写入 .yuque-members.json，与 webhook 格式一致。"""
+    p = output_dir / ".yuque-members.json"
+    p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 async def _request_with_retry(
@@ -116,22 +173,76 @@ class YuqueClient:
         r.raise_for_status()
         return r.json().get("data", {})
 
+    async def get_group_members_page(self, group_id: int, page: int) -> List[Dict]:
+        """GET /groups/{id}/statistics/members 分页，与 yuque-sync-platform 一致。404（个人账号非团队）返回空列表。"""
+        path = f"/groups/{group_id}/statistics/members?page={page}"
+        r = await self._get(path)
+        if r.status_code == 404:
+            return []
+        r.raise_for_status()
+        return r.json().get("data", {}).get("members", [])
+
+
+async def fetch_and_write_team_members(client: YuqueClient, group_id: int, output_dir: Path) -> None:
+    """全量同步前拉取团队成员并写入 .yuque-members.json（参考 yuque-sync-platform sync_team_members）。"""
+    members = _read_members(output_dir)
+    page = 1
+    fetched_any = False
+    while True:
+        try:
+            raw = await client.get_group_members_page(group_id, page)
+        except Exception as e:
+            logger.warning("fetch team members page %s failed (e.g. personal account): %s", page, e)
+            break
+        if not raw:
+            break
+        fetched_any = True
+        for item in raw:
+            user_info = item.get("user") or {}
+            uid = user_info.get("id") or item.get("user_id")
+            if not uid:
+                continue
+            uid_str = str(uid)
+            members[uid_str] = {
+                "name": (user_info.get("name") or "Unknown").strip(),
+                "login": (user_info.get("login") or f"u_{uid}").strip(),
+            }
+        page += 1
+        if YUQUE_SYNC_REQUEST_DELAY > 0:
+            await asyncio.sleep(0.2)
+    if fetched_any:
+        _write_members(output_dir, members)
+        logger.info("Wrote .yuque-members.json with %s members", len(members))
+
 
 def _build_md(detail: Dict[str, Any], author_name: str = "") -> str:
-    fm = {k: v for k, v in detail.items() if k not in ("body", "body_html") and v is not None}
-    created = detail.get("created_at") or ""
-    updated = detail.get("updated_at") or detail.get("content_updated_at") or ""
-    if isinstance(created, str) and "T" in created:
-        created = created.replace("Z", "+00:00")[:19].replace("T", " ")
-    if isinstance(updated, str) and "T" in updated:
-        updated = updated.replace("Z", "+00:00")[:19].replace("T", " ")
+    """frontmatter 与 webhook_server 一致：仅 id/title/slug/created_at/updated_at/author/book_name/description/cover；时间为本地可读。"""
+    created = _normalize_ts_local(detail.get("created_at") or "")
+    updated = _normalize_ts_local(detail.get("updated_at") or detail.get("content_updated_at") or "")
+
+    fm = {}
+    for k in ("id", "title", "slug"):
+        if k in detail and detail[k] is not None:
+            fm[k] = detail[k]
+    fm["created_at"] = created
+    fm["updated_at"] = updated
+    if author_name:
+        fm["author"] = author_name
+    book = detail.get("book")
+    if isinstance(book, dict) and (book.get("name") or "").strip():
+        fm["book_name"] = (book.get("name") or "").strip()
+    for k in ("description", "cover"):
+        v = detail.get(k)
+        if v and isinstance(v, str) and v.strip():
+            fm[k] = v.strip()
 
     yaml_block = yaml.dump(fm, allow_unicode=True, default_flow_style=False, sort_keys=False).strip()
-    def esc(x):
-        return (x or "").replace("|", "\\|").replace("\n", " ").strip()
+    table_cell = (lambda x: x.replace("|", "\\|").replace("\n", " ").strip() if x else "")
+    author_display = table_cell(author_name or str(detail.get("user_id") or ""))
+
     md = "---\n" + yaml_block + "\n---\n\n"
     md += "| 作者 | 创建时间 | 更新时间 |\n|------|----------|----------|\n"
-    md += f"| {esc(author_name)} | {esc(str(created))} | {esc(str(updated))} |\n\n"
+    md += f"| {author_display} | {table_cell(str(created))} | {table_cell(str(updated))} |\n\n"
     md += (detail.get("body") or "").strip()
     if not md.rstrip():
         pass
@@ -140,16 +251,33 @@ def _build_md(detail: Dict[str, Any], author_name: str = "") -> str:
     return md
 
 
+def _resolve_doc_basename(used_bases: Dict[tuple, set], repo_dir_name: str, parent_path: str, base: str) -> str:
+    """同目录下重名时用 base_2.md、base_3.md，与 webhook 一致。"""
+    key = (repo_dir_name, parent_path)
+    used = used_bases.setdefault(key, set())
+    stem = base
+    if stem in used:
+        i = 2
+        while f"{stem}_{i}" in used:
+            i += 1
+        stem = f"{stem}_{i}"
+    used.add(stem)
+    return stem + ".md"
+
+
 async def _process_toc_item(
     client: YuqueClient,
     repo_id: int,
-    repo_slug: str,
+    repo_dir_name: str,
     output_dir: Path,
     toc_item: Dict,
     parent_path: str,
     toc_by_uuid: Dict[str, Dict],
     index: Optional[Dict[str, str]] = None,
+    used_bases: Optional[Dict[tuple, set]] = None,
 ) -> None:
+    if used_bases is None:
+        used_bases = {}
     doc_type = toc_item.get("type", "")
     slug = toc_item.get("url") or toc_item.get("slug") or toc_item.get("uuid", "")
     yuque_id = toc_item.get("id")
@@ -161,10 +289,12 @@ async def _process_toc_item(
         if not detail:
             logger.warning("  skip doc (no detail): %s", toc_item.get("title"))
             return
+        base = _doc_basename(detail.get("title"), slug or "")
+        doc_filename = _resolve_doc_basename(used_bases, repo_dir_name, parent_path, base)
         if parent_path:
-            out_file = output_dir / repo_slug / parent_path / (_slug_safe(slug) + ".md")
+            out_file = output_dir / repo_dir_name / parent_path / doc_filename
         else:
-            out_file = output_dir / repo_slug / (_slug_safe(slug) + ".md")
+            out_file = output_dir / repo_dir_name / doc_filename
         out_file.parent.mkdir(parents=True, exist_ok=True)
         rel_path = str(out_file.relative_to(output_dir))
         if yuque_id is not None and index is not None:
@@ -174,7 +304,14 @@ async def _process_toc_item(
                 if old_full.exists():
                     old_full.unlink()
                     logger.info("  removed old path (move): %s", old_path)
-        content = _build_md(detail, "")
+        members = _read_members(output_dir)
+        user_id_str = str(detail.get("last_editor_id") or detail.get("user_id") or "")
+        author_name = ""
+        if user_id_str and user_id_str in members:
+            author_name = (members[user_id_str].get("name") or members[user_id_str].get("login") or "").strip()
+        if not author_name:
+            author_name = _author_name_from_detail(detail)
+        content = _build_md(detail, author_name)
         out_file.write_text(content, encoding="utf-8")
         if yuque_id is not None and index is not None:
             index[str(yuque_id)] = rel_path
@@ -182,9 +319,9 @@ async def _process_toc_item(
     elif doc_type == "TITLE" or doc_type == "SHEET":
         seg = _slug_safe(toc_item.get("title") or toc_item.get("uuid", ""))
         next_parent = f"{parent_path}/{seg}" if parent_path else seg
-        (output_dir / repo_slug / next_parent).mkdir(parents=True, exist_ok=True)
+        (output_dir / repo_dir_name / next_parent).mkdir(parents=True, exist_ok=True)
         for child in toc_list_children(toc_item.get("uuid"), toc_by_uuid):
-            await _process_toc_item(client, repo_id, repo_slug, output_dir, child, next_parent, toc_by_uuid, index)
+            await _process_toc_item(client, repo_id, repo_dir_name, output_dir, child, next_parent, toc_by_uuid, index, used_bases)
 
 
 def toc_list_children(parent_uuid: Optional[str], toc_by_uuid: Dict[str, Dict]) -> List[Dict]:
@@ -231,8 +368,9 @@ async def sync_repo(
 
     toc_by_uuid = {n["uuid"]: n for n in toc_list if n.get("uuid")}
     roots = toc_list_children(None, toc_by_uuid)
+    used_bases: Dict[tuple, set] = {}
     for item in roots:
-        await _process_toc_item(client, repo_id, repo_dir_name, output_dir, item, "", toc_by_uuid, index)
+        await _process_toc_item(client, repo_id, repo_dir_name, output_dir, item, "", toc_by_uuid, index, used_bases)
 
 
 async def main_async(output_dir: Path, repo_id: Optional[int], mark_all_pushed: bool) -> None:
@@ -257,6 +395,8 @@ async def main_async(output_dir: Path, repo_id: Optional[int], mark_all_pushed: 
     output_dir.mkdir(parents=True, exist_ok=True)
     if not (output_dir / ".git").exists():
         subprocess.run(["git", "init"], cwd=output_dir, check=True, capture_output=True)
+
+    await fetch_and_write_team_members(client, user_id, output_dir)
 
     index = _read_id_to_path_index(output_dir)
     repos_meta = []
