@@ -220,8 +220,9 @@ async def sync_repo(
     index: Optional[Dict[str, str]] = None,
 ) -> None:
     repo_id = repo["id"]
-    repo_slug = _slug_safe(repo.get("slug", "") or str(repo_id))
-    repo_dir = output_dir / repo_slug
+    # 与 webhook 一致：目录用知识库名称，不用 slug
+    repo_dir_name = _slug_safe(repo.get("name", "") or repo.get("slug", "") or str(repo_id))
+    repo_dir = output_dir / repo_dir_name
     repo_dir.mkdir(parents=True, exist_ok=True)
 
     toc_list = await client.get_repo_toc(repo_id)
@@ -231,7 +232,7 @@ async def sync_repo(
     toc_by_uuid = {n["uuid"]: n for n in toc_list if n.get("uuid")}
     roots = toc_list_children(None, toc_by_uuid)
     for item in roots:
-        await _process_toc_item(client, repo_id, repo_slug, output_dir, item, "", toc_by_uuid, index)
+        await _process_toc_item(client, repo_id, repo_dir_name, output_dir, item, "", toc_by_uuid, index)
 
 
 async def main_async(output_dir: Path, repo_id: Optional[int], mark_all_pushed: bool) -> None:
@@ -262,9 +263,9 @@ async def main_async(output_dir: Path, repo_id: Optional[int], mark_all_pushed: 
     for i, repo in enumerate(repos):
         if i > 0 and YUQUE_SYNC_REQUEST_DELAY > 0:
             await asyncio.sleep(YUQUE_SYNC_REQUEST_DELAY * 2)
-        repo_slug = _slug_safe(repo.get("slug", "") or str(repo["id"]))
+        repo_dir_name = _slug_safe(repo.get("name", "") or repo.get("slug", "") or str(repo["id"]))
         await sync_repo(client, repo, output_dir, index)
-        repos_meta.append({"id": repo["id"], "slug": repo.get("slug"), "name": repo.get("name"), "dir": repo_slug})
+        repos_meta.append({"id": repo["id"], "slug": repo.get("slug"), "name": repo.get("name"), "dir": repo_dir_name})
     _write_id_to_path_index(output_dir, index)
 
     (output_dir / ".repos.json").write_text(
