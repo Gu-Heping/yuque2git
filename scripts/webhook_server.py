@@ -30,6 +30,8 @@ YUQUE_BASE_URL = os.environ.get("YUQUE_BASE_URL", "https://nova.yuque.com/api/v2
 OUTPUT_DIR: Optional[Path] = None
 PUSH_DECISION_MODE = os.environ.get("PUSH_DECISION_MODE", "llm")  # llm | openclaw
 OPENCLAW_CALLBACK_URL = os.environ.get("OPENCLAW_CALLBACK_URL", "").strip() or os.environ.get("PUSH_CALLBACK_URL", "").strip()
+OPENCLAW_HOOKS_TOKEN = os.environ.get("OPENCLAW_HOOKS_TOKEN", "").strip()
+YUQUE2GIT_PUBLIC_URL = os.environ.get("YUQUE2GIT_PUBLIC_URL", "").strip()
 NOTIFY_URL = os.environ.get("NOTIFY_URL", "").strip()
 LAST_PUSH_FILE = ".yuque-last-push.json"  # key: yuque_id (str), value: commit hash
 IDX_FILE = ".yuque-id-to-path.json"  # key: yuque_id (str), value: rel_path，用于文档移动时 diff 查旧路径
@@ -539,6 +541,12 @@ async def _send_email_push(
     )
 
 
+def _is_openclaw_hooks_agent_url(url: str) -> bool:
+    """是否指向 OpenClaw Gateway 的 /hooks/agent 入口。"""
+    u = (url or "").rstrip("/")
+    return u.endswith("/hooks/agent")
+
+
 async def _openclaw_callback(
     yuque_id: int,
     repo_slug: str,
@@ -552,19 +560,39 @@ async def _openclaw_callback(
     if not OPENCLAW_CALLBACK_URL:
         logger.warning("OPENCLAW_CALLBACK_URL not set")
         return
-    body = {
-        "yuque_id": yuque_id,
-        "repo_slug": repo_slug,
-        "doc_slug": doc_slug,
-        "title": title,
-        "repo_name": repo_name,
-        "diff": diff,
-        "commit": commit,
-        "action": "should_push",
-    }
+    if _is_openclaw_hooks_agent_url(OPENCLAW_CALLBACK_URL):
+        callback_instruction = (
+            f"若决定推送，请向以下 URL 发送 POST 请求：{YUQUE2GIT_PUBLIC_URL.rstrip('/')}/mark-pushed，"
+            f"Body JSON：{{\"yuque_id\": {yuque_id}, \"commit\": \"{commit}\"}}。"
+            if YUQUE2GIT_PUBLIC_URL
+            else "若决定推送，请向部署本 yuque2git 服务的 /mark-pushed 发起 POST，Body JSON 含 yuque_id 与 commit。"
+        )
+        message = (
+            f"【yuque2git 推送判定】\n\n"
+            f"文档标题：{title}\n知识库：{repo_name}\n仓库：{repo_slug}\n文档：{doc_slug}\n\n"
+            f"请根据以下 diff 判断是否推送到远程。{callback_instruction}\n\n---\n\nDiff:\n{diff}"
+        )
+        body = {"message": message, "name": "yuque2git", "deliver": False}
+        headers = {}
+        if OPENCLAW_HOOKS_TOKEN:
+            headers["Authorization"] = f"Bearer {OPENCLAW_HOOKS_TOKEN}"
+        else:
+            logger.warning("OPENCLAW_HOOKS_TOKEN not set, Gateway may return 401")
+    else:
+        body = {
+            "yuque_id": yuque_id,
+            "repo_slug": repo_slug,
+            "doc_slug": doc_slug,
+            "title": title,
+            "repo_name": repo_name,
+            "diff": diff,
+            "commit": commit,
+            "action": "should_push",
+        }
+        headers = {}
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
-            await client.post(OPENCLAW_CALLBACK_URL, json=body)
+            await client.post(OPENCLAW_CALLBACK_URL, json=body, headers=headers or None)
     except Exception as e:
         logger.warning("OpenClaw callback POST failed: %s", e)
 

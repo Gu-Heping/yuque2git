@@ -53,7 +53,9 @@
 | `LLM_TIMEOUT` | 可选，LLM 请求超时秒数，默认 25 |
 | `ENABLE_BODY_ONLY_DIFF` | 可选，`true` 时只对正文做 diff（去掉 frontmatter/表格），省 token、降噪，默认 true |
 | **OpenClaw 模式** | |
-| `OPENCLAW_CALLBACK_URL` | 待判定事件 POST 的 URL；完成后由 OpenClaw 调用本服务 `POST /mark-pushed` |
+| `OPENCLAW_CALLBACK_URL` | 待判定事件 POST 的 URL。**推荐**填 OpenClaw Gateway 的 Hooks 入口：`http(s)://<gateway>:<port>/hooks/agent`，则走官方 Hooks 协议（message + Bearer） |
+| `OPENCLAW_HOOKS_TOKEN` | 当 URL 为 `/hooks/agent` 时必填，与 `~/.openclaw/openclaw.json` 的 `hooks.token` 一致，用于 `Authorization: Bearer` |
+| `YUQUE2GIT_PUBLIC_URL` | 可选。yuque2git 服务对外可访问的 base URL（如 `http://host:8765`），写入 prompt 供 OpenClaw Agent 回调 `POST /mark-pushed`；未设则 prompt 中为占位说明 |
 | `WEBHOOK_SECRET` | 可选，校验语雀 Webhook 签名 |
 
 ## 使用方式
@@ -98,7 +100,8 @@
 
 - **Diff 基准**：以「最后推送时的文档状态」与当前状态做 diff，由 AI 或 OpenClaw 判定是否推送。
 - **LLM 模式**（`PUSH_DECISION_MODE=llm`）：服务内调 LLM 得 YES/NO 与可选更新总结；需配置 `OPENAI_API_KEY` 等。无实质变更（diff 为「无文本变更」或「文档移动内容无变更」）时**不调 LLM**，直接不推送以省 token。默认只对**正文**做 diff（`ENABLE_BODY_ONLY_DIFF=true`），若推送则调用 `NOTIFY_URL` 并更新 last-push。
-- **OpenClaw 模式**（`PUSH_DECISION_MODE=openclaw`）：服务把待判定事件 POST 到 `OPENCLAW_CALLBACK_URL`，由 OpenClaw 自定义判断与推送方式；完成后回调本服务 `POST /mark-pushed`（body 含 `yuque_id` 与 `commit`）更新 last-push。
+- **OpenClaw 模式**（`PUSH_DECISION_MODE=openclaw`）：服务把待判定事件 POST 到 `OPENCLAW_CALLBACK_URL`，由 OpenClaw 判定是否推送；完成后由 Agent 回调本服务 `POST /mark-pushed`（body 含 `yuque_id` 与 `commit`）更新 last-push。
+  - **接入 OpenClaw Gateway Hooks**（推荐）：将 `OPENCLAW_CALLBACK_URL` 设为 `http(s)://<gateway>:<port>/hooks/agent`，并配置 `OPENCLAW_HOOKS_TOKEN`（与 openclaw 的 `hooks.token` 一致）、可选 `YUQUE2GIT_PUBLIC_URL`。在 OpenClaw 侧：于 `~/.openclaw/openclaw.json` 的 `hooks` 下启用对外 Hooks（`hooks.enabled: true`、`hooks.token: "<共享密钥>"`），并确保 main（或目标）Agent 能访问 yuque2git（如允许 `exec` 执行 `curl` 调用 `YUQUE2GIT_PUBLIC_URL/mark-pushed`），网络允许 Gateway 访问 yuque2git 服务。
 
 ## 元数据
 

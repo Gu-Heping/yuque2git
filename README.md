@@ -20,7 +20,9 @@
 5. 在语雀知识库后台配置 Webhook URL 指向该服务（如 `http://your-host:8765/webhook`）。
 6. 可选：运行 `scripts/sync_to_files.py` 做全量同步；运行 `scripts/sync_toc.py` 定期同步 TOC（语雀 TOC 变更不触发 webhook）。二者若不传 `--output-dir` 会使用环境变量 `OUTPUT_DIR`。
 
-**智能 diff**：推送判定以前一次推送为基准做 diff。输出目录内的 `.yuque-id-to-path.json` 记录每篇文档的路径；文档在语雀中移动父节点导致路径变化时，仍能按「旧路径 vs 新路径」正确算 diff。**Token 优化**：无实质变更时不调 LLM；默认只对正文做 diff（`ENABLE_BODY_ONLY_DIFF=true`），减少 frontmatter 噪音与消耗。详见 [SKILL.md](SKILL.md) 中的配置项、推送模式（LLM / OpenClaw）与排错说明。
+**智能 diff**：推送判定以前一次推送为基准做 diff。输出目录内的 `.yuque-id-to-path.json` 记录每篇文档的路径；文档在语雀中移动父节点导致路径变化时，仍能按「旧路径 vs 新路径」正确算 diff。**Token 优化**：无实质变更时不调 LLM；默认只对正文做 diff（`ENABLE_BODY_ONLY_DIFF=true`），减少 frontmatter 噪音与消耗。
+
+**与 OpenClaw 对接**：若使用 `PUSH_DECISION_MODE=openclaw`，可将 `OPENCLAW_CALLBACK_URL` 设为 OpenClaw Gateway 的 `http(s)://<gateway>:<port>/hooks/agent`，并配置 `OPENCLAW_HOOKS_TOKEN`、可选 `YUQUE2GIT_PUBLIC_URL`；OpenClaw 侧需在 `openclaw.json` 启用 hooks 并确保 Agent 能回调 yuque2git 的 `/mark-pushed`。详见 [SKILL.md](SKILL.md) 的「OpenClaw 模式」与配置表。
 
 ## 运行测试
 

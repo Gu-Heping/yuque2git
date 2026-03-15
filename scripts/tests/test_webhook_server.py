@@ -25,6 +25,7 @@ from webhook_server import (
     _read_last_push,
     _write_last_push,
     _update_last_push_for,
+    _is_openclaw_hooks_agent_url,
     WebhookPayload,
     WebhookData,
     WebhookBook,
@@ -165,6 +166,18 @@ class TestGetDiff:
         subprocess.run(["git", "commit", "-m", "second"], cwd=tmp_path, check=True, capture_output=True)
         diff = _get_diff(tmp_path, c1, "a.md")
         assert "v2" in diff or "v1" in diff or "无文本变更" in diff or "+" in diff or "-" in diff
+
+
+class TestOpenClawHooksUrl:
+    def test_hooks_agent_detected(self):
+        assert _is_openclaw_hooks_agent_url("http://localhost:13040/hooks/agent") is True
+        assert _is_openclaw_hooks_agent_url("https://gateway.example.com/hooks/agent") is True
+        assert _is_openclaw_hooks_agent_url("http://host/hooks/agent/") is True
+
+    def test_non_hooks_agent_not_detected(self):
+        assert _is_openclaw_hooks_agent_url("http://localhost:13040/custom") is False
+        assert _is_openclaw_hooks_agent_url("http://host/hooks") is False
+        assert _is_openclaw_hooks_agent_url("") is False
 
 
 class TestWebhookPayload:
