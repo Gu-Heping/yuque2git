@@ -72,10 +72,12 @@ metadata: '{"openclaw":{"requires":{"bins":["python3"],"env":["YUQUE_TOKEN"]},"h
 | `OPENCLAW_CALLBACK_URL` | 待判定事件 POST 的 URL。**推荐**填 OpenClaw Gateway 的 Hooks 入口：`http(s)://<gateway>:<port>/hooks/agent`，则走官方 Hooks 协议（message + Bearer） |
 | `OPENCLAW_HOOKS_TOKEN` | 当 URL 为 `/hooks/agent` 时必填，与 `~/.openclaw/openclaw.json` 的 `hooks.token` 一致，用于 `Authorization: Bearer` |
 | `YUQUE2GIT_PUBLIC_URL` | 可选。yuque2git 服务对外可访问的 base URL（如 `http://host:8765`），写入 prompt 供 OpenClaw Agent 回调 `POST /mark-pushed`；未设则 prompt 中为占位说明 |
-| `YUQUE2GIT_DELIVER_CHANNEL` | ???? `YUQUE2GIT_DELIVER_TO` ??????yuque2git ??????????????? Gateway Hooks ? `deliver: true` ?? channel/to ????????channel ? OpenClaw ?????? `qq`? |
+| `YUQUE2GIT_DELIVER_CHANNEL` | 与 `YUQUE2GIT_DELIVER_TO` 配合；设置后 yuque2git 请求 Gateway Hooks 时会带 `deliver: true` 及 channel/to；channel 填 OpenClaw 通道名如 `qq` |
 | `YUQUE2GIT_DELIVER_TO` | 可选。投递目标，支持**多选**：逗号分隔多个 ID（如 `1179350197,群ID2`），同一 channel 下会收到同一条回复 |
-| `YUQUE2GIT_DELIVER_TARGETS` | 可选。多目标 JSON 数组，覆盖 CHANNEL+TO。例：`[{"channel":"qq","to":"1179350197"},{"channel":"qq","to":"456"}]`。请求中会带 `deliver_to` 数组；若 Gateway 支持多目标投递，会向每项各发一条 |
-| `YUQUE2GIT_OPENCLAW_MESSAGE_TEMPLATE` | ???????? Agent ??? message?????`{title}`?`{repo_name}`?`{repo_slug}`?`{doc_slug}`?`{diff}`?`{yuque_id}`?`{commit}`?`{callback_instruction}`?`{author}`?`{doc_url}`?`{local_path}`??? OUTPUT_DIR ?????????`{reply_contract}`????? `{reply_contract}`?? Agent ???? JSON ???? `/mark-pushed` |
+| `YUQUE2GIT_DELIVER_TARGETS` | 可选。多目标 JSON 数组，覆盖 CHANNEL+TO。例：`[{"channel":"qq","to":"g:1087044655"},{"channel":"qq","to":"p:1179350197"}]`。群为 `g:群号`，私聊为 `p:QQ号`；直连时与 Napcat 的 group_id/user_id 对应 |
+| `YUQUE2GIT_DIRECT_SEND_URL` | 可选。直连投递时 Napcat OneBot 11 HTTP API 的 base URL（如 `http://127.0.0.1:3000`）。**非空时**摘要由 yuque2git 直连 Napcat 发送，不经 Gateway Agent 轮次，QQ 收到 OpenClaw 生成的摘要原文 |
+| `YUQUE2GIT_DIRECT_SEND_TOKEN` | 可选。与 Napcat HTTP 服务配置的 token 一致时，直连请求头加 `Authorization: Bearer <token>` |
+| `YUQUE2GIT_OPENCLAW_MESSAGE_TEMPLATE` | 自定义发给 Agent 的 message 模板；占位符含 `{title}`、`{repo_name}`、`{repo_slug}`、`{doc_slug}`、`{diff}`、`{yuque_id}`、`{commit}`、`{callback_instruction}`、`{author}`、`{doc_url}`、`{local_path}`（本地路径，相对于 OUTPUT_DIR）；另支持 `{reply_contract}`，即 Agent 须先 POST 的 JSON 契约说明（/mark-pushed） |
 | `YUQUE_NAMESPACE` | 可选。语雀命名空间（团队/用户 login），用于生成原文地址；未设时从文档详情的 book.user.login 取 |
 | `WEBHOOK_SECRET` | 可选，校验语雀 Webhook 签名 |
 
@@ -126,8 +128,46 @@ metadata: '{"openclaw":{"requires":{"bins":["python3"],"env":["YUQUE_TOKEN"]},"h
 
 - **Diff 基准**：以「最后推送时的文档状态」与当前状态做 diff，由 AI 或 OpenClaw 判定是否推送。
 - **LLM 模式**（`PUSH_DECISION_MODE=llm`）：服务内调 LLM 得 YES/NO 与可选更新总结；需配置 `OPENAI_API_KEY` 等。无实质变更（diff 为「无文本变更」或「文档移动内容无变更」）时**不调 LLM**，直接不推送以省 token。默认只对**正文**做 diff（`ENABLE_BODY_ONLY_DIFF=true`），若推送则调用 `NOTIFY_URL` 并更新 last-push。
-- **OpenClaw ??**?`PUSH_DECISION_MODE=openclaw`?????????? POST ? `OPENCLAW_CALLBACK_URL`?? OpenClaw ??????????? Agent ????? `POST /mark-pushed`??? body ???? `yuque_id`?`commit`?`should_push`?? `should_push=true`????? `summary`????? `title`?`repo_name`?`author`?`doc_url`?`highlights`?1?3 ???
-  - **?? OpenClaw Gateway Hooks**?????? `OPENCLAW_CALLBACK_URL` ?? `http(s)://<gateway>:<port>/hooks/agent`???? `OPENCLAW_HOOKS_TOKEN`?? openclaw ? `hooks.token` ?????? `YUQUE2GIT_PUBLIC_URL`????????? QQ????? `YUQUE2GIT_DELIVER_CHANNEL=qq` ? `YUQUE2GIT_DELIVER_TO=<?ID???ID>`??? Agent ???????? JSON???????? yuque2git ?????????????? prompt ?? `YUQUE2GIT_OPENCLAW_MESSAGE_TEMPLATE`???????????? `{reply_contract}`?? OpenClaw ??? `~/.openclaw/openclaw.json` ? `hooks` ????? Hooks?`hooks.enabled: true`?`hooks.token: "<????>"`????? main?????Agent ??? yuque2git???? `exec` ?? `curl` ?? `YUQUE2GIT_PUBLIC_URL/mark-pushed`?????? Gateway ?? yuque2git ???
+- **OpenClaw 模式**（`PUSH_DECISION_MODE=openclaw`）：将待判定事件 POST 到 `OPENCLAW_CALLBACK_URL`，由 OpenClaw Agent 判定后回调 `POST /mark-pushed`，body 须含 `yuque_id`、`commit`、`should_push`；当 `should_push=true` 时还须带 `summary`，含 `title`、`repo_name`、`author`、`doc_url`、`highlights`（1～3 条）。
+  - **接入 OpenClaw Gateway Hooks**（推荐）：将 `OPENCLAW_CALLBACK_URL` 设为 `http(s)://<gateway>:<port>/hooks/agent`，并配置 `OPENCLAW_HOOKS_TOKEN`（与 openclaw 的 `hooks.token` 一致）、可选 `YUQUE2GIT_PUBLIC_URL`。若希望投递到 QQ，设置 `YUQUE2GIT_DELIVER_CHANNEL=qq` 与 `YUQUE2GIT_DELIVER_TO=<群ID或用户ID>`（群为 `g:群号`，私聊为 `p:QQ号`）。Agent 须先向 `/mark-pushed` 回调结构化 JSON，由 yuque2git 统一生成并投递最终文案；自定义 prompt 可用 `YUQUE2GIT_OPENCLAW_MESSAGE_TEMPLATE`，占位符见上表，其中 `{reply_contract}` 为 Agent 须遵守的 JSON 契约说明。OpenClaw 侧在 `~/.openclaw/openclaw.json` 的 `hooks` 下启用 Hooks（`hooks.enabled: true`、`hooks.token: "<共享密钥>"`），并确保 main（或目标）Agent 能访问 yuque2git（如通过 `exec` 执行 `curl` 调用 `YUQUE2GIT_PUBLIC_URL/mark-pushed`），网络允许 Gateway 访问 yuque2git 服务。
+  - **直连发 QQ（B 方案）**：设置 `YUQUE2GIT_DIRECT_SEND_URL`（如 `http://127.0.0.1:3000`）后，摘要由 yuque2git 直连 Napcat 的 OneBot 11 API 发送，不经 Gateway 的 Agent 投递轮次，QQ 收到的是 OpenClaw 回调中的摘要原文；可选 `YUQUE2GIT_DIRECT_SEND_TOKEN` 与 Napcat HTTP token 一致。yuque2git 需能访问 Napcat 端口（本机或宿主机映射）。
+
+## 回调失败自救（Runbook）
+
+- `yuque_id` 必须是**整数 id**，不要传文档 slug（如 `rbzpfpk9o939ptw8`）。
+- 若 `should_push=true`，`summary` 必须包含 `title`、`repo_name`、`author`、`doc_url`、`highlights`（1～3 条）。
+- 失败事件会写入 `OUTPUT_DIR/.yuque-pending-pushes.jsonl`（可用 `PENDING_PUSH_FILE` 自定义），用于后续重放。
+- 常见错误：
+  - `422 int_parsing`: `yuque_id` 类型错误（通常传了 slug）。
+  - `400 summary missing or invalid`: `summary` 字段不完整或非法。
+- 手工补发模板：
+
+```bash
+curl -sS -X POST "http://127.0.0.1:8765/mark-pushed" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "yuque_id": 261997991,
+    "commit": "e80935e",
+    "should_push": true,
+    "summary": {
+      "title": "文档标题",
+      "repo_name": "知识库名称",
+      "author": "作者",
+      "doc_url": "https://nova.yuque.com/namespace/repo/doc",
+      "highlights": ["更新要点 1"]
+    }
+  }'
+```
+
+- **自动重放 pending 队列**（一次性执行后退出）：
+
+  `python scripts/webhook_server.py --output-dir /path/to/repo --replay-pending --replay-limit 50`
+
+  重放会读取 `OUTPUT_DIR` 下 pending 文件（默认 `.yuque-pending-pushes.jsonl`），按类型重放 `mark_pushed_invalid_*`（本地 POST `/mark-pushed`）与 `openclaw_*_failed`（重试发往 `OPENCLAW_CALLBACK_URL`），结果以追加行写入同文件（`status=done` / `retry_failed` / `invalid_payload`）。
+
+- **查看 pending 最新 20 条**：`tail -n 20 /path/to/repo/.yuque-pending-pushes.jsonl`（排障时确认待重放内容；若改了 `PENDING_PUSH_FILE` 请用实际路径）。
+
+- **排障顺序**：① 确认服务 `/health` 正常、`OUTPUT_DIR` 与 `YUQUE2GIT_PUBLIC_URL` 正确；② 用 `tail` 查看 pending 区分事件类型；③ 执行 `--replay-pending`；④ 仍有 4xx 时按日志修正 payload 后再次重放或手工 curl。
 
 ## 元数据
 

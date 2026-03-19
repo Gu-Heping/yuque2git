@@ -5,6 +5,7 @@ yuque2git Webhook 服务：接收语雀 Webhook，写本地 Markdown + Git commi
 import argparse
 import asyncio
 import difflib
+import fcntl
 import json
 import logging
 import os
@@ -17,17 +18,21 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
 from string import Formatter
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple, Union
 from zoneinfo import ZoneInfo
 
 import httpx
 import uvicorn
 import yaml
 from fastapi import FastAPI, Request, Response
+from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# 文件日志路径（在 main() 中挂载）
+_WEBHOOK_LOG_FILE: Optional[Path] = None
 
 # --- 配置 ---
 YUQUE_TOKEN = os.environ.get("YUQUE_TOKEN", "")
@@ -45,6 +50,9 @@ YUQUE2GIT_DELIVER_TARGETS_JSON = os.environ.get("YUQUE2GIT_DELIVER_TARGETS", "")
 YUQUE2GIT_DELIVER_DELAY_SECONDS = max(0.0, float(os.environ.get("YUQUE2GIT_DELIVER_DELAY_SECONDS", "2.0")))
 # OpenClaw/Gateway 返回 429 时的最大重试次数（每次指数退避），默认 3
 YUQUE2GIT_DELIVER_MAX_RETRIES = max(0, int(os.environ.get("YUQUE2GIT_DELIVER_MAX_RETRIES", "3")))
+# 直连 Napcat 发 QQ：非空时摘要投递走 Napcat send_group_msg/send_private_msg，不再 POST 到 Gateway
+YUQUE2GIT_DIRECT_SEND_URL = os.environ.get("YUQUE2GIT_DIRECT_SEND_URL", "").strip().rstrip("/")
+YUQUE2GIT_DIRECT_SEND_TOKEN = os.environ.get("YUQUE2GIT_DIRECT_SEND_TOKEN", "").strip()
 YUQUE2GIT_OPENCLAW_MESSAGE_TEMPLATE = os.environ.get("YUQUE2GIT_OPENCLAW_MESSAGE_TEMPLATE", "").strip()
 # 语雀文档原文地址：用于生成 doc_url，未设时从 detail.book.user.login 取
 YUQUE_NAMESPACE = os.environ.get("YUQUE_NAMESPACE", "").strip()
@@ -54,6 +62,9 @@ NOTIFY_URL = os.environ.get("NOTIFY_URL", "").strip()
 LAST_PUSH_FILE = ".yuque-last-push.json"  # key: yuque_id (str), value: commit hash
 IDX_FILE = ".yuque-id-to-path.json"  # key: yuque_id (str), value: rel_path，用于文档移动时 diff 查旧路径
 MEMBERS_FILE = ".yuque-members.json"  # key: user_id (str), value: {"name": "...", "login": "..."}，本地缓存避免重复请求
+PENDING_PUSH_FILE = os.environ.get("PENDING_PUSH_FILE", ".yuque-pending-pushes.jsonl").strip() or ".yuque-pending-pushes.jsonl"
+PENDING_REPLAY_LOCK_FILE = ".yuque-replay.lock"
+REPLAY_MARK_PUSHED_BASE_URL = (os.environ.get("YUQUE2GIT_PUBLIC_URL", "").strip() or "http://127.0.0.1:8765").rstrip("/")
 # 邮件推送（可选）：SMTP 配置，全部设置后则在判定推送时发邮件
 SMTP_HOST = os.environ.get("SMTP_HOST", "").strip()
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
@@ -107,7 +118,7 @@ class WebhookPayload(BaseModel):
 
 
 class MarkPushedBody(BaseModel):
-    yuque_id: int
+    yuque_id: Union[int, str]
     commit: str
     should_push: bool = True
     repo_slug: Optional[str] = None
@@ -567,6 +578,385 @@ def _find_doc_path_by_yuque_id_any_repo(output_dir: Path, yuque_id: int) -> Opti
     return None
 
 
+def _doc_meta_from_md(file_path: Path) -> Dict[str, Any]:
+    """读取文档 frontmatter 元数据，失败时返回空 dict。"""
+    try:
+        raw = file_path.read_text(encoding="utf-8")
+        if not raw.startswith("---"):
+            return {}
+        end = raw.index("---", 3) if "---" in raw[3:] else -1
+        if end <= 0:
+            return {}
+        fm = yaml.safe_load(raw[3:end])
+        return fm if isinstance(fm, dict) else {}
+    except Exception:
+        return {}
+
+
+def _resolve_yuque_id_for_mark_pushed(
+    output_dir: Path,
+    raw_yuque_id: Union[int, str],
+    repo_slug: Optional[str],
+    doc_slug: Optional[str],
+) -> Tuple[Optional[int], str]:
+    """兼容 mark-pushed 的 yuque_id 误参（如传 slug）并返回解析来源。"""
+    if isinstance(raw_yuque_id, int):
+        return raw_yuque_id, "int"
+    if isinstance(raw_yuque_id, str) and raw_yuque_id.isdigit():
+        return int(raw_yuque_id), "numeric-string"
+
+    candidate_slug = (doc_slug or "").strip() or (str(raw_yuque_id).strip() if isinstance(raw_yuque_id, str) else "")
+    if not candidate_slug:
+        return None, "invalid-empty"
+
+    # 先尝试按索引映射到路径，再读取 frontmatter 获取真实 id。
+    idx = _read_index(output_dir)
+    search_paths: List[str] = []
+    if repo_slug:
+        repo_prefix = _slug_safe(repo_slug).rstrip("/") + "/"
+        search_paths.extend([p for p in idx.values() if isinstance(p, str) and p.startswith(repo_prefix)])
+    search_paths.extend([p for p in idx.values() if isinstance(p, str) and p not in search_paths])
+
+    for rel in search_paths:
+        md = output_dir / rel
+        fm = _doc_meta_from_md(md)
+        if not fm:
+            continue
+        fm_slug = str(fm.get("slug") or "").strip()
+        if fm_slug != candidate_slug:
+            continue
+        doc_id = fm.get("id") if fm.get("id") is not None else fm.get("yuque_id")
+        if isinstance(doc_id, int):
+            return doc_id, "slug-frontmatter-index"
+        if isinstance(doc_id, str) and doc_id.isdigit():
+            return int(doc_id), "slug-frontmatter-index"
+
+    # 索引里未命中时，回退到遍历仓库目录。
+    repo_dir = output_dir / _slug_safe(repo_slug) if repo_slug else output_dir
+    scan_dirs = [repo_dir] if repo_slug and repo_dir.is_dir() else [d for d in output_dir.iterdir() if d.is_dir() and not d.name.startswith(".")]
+    for base in scan_dirs:
+        for md in base.rglob("*.md"):
+            fm = _doc_meta_from_md(md)
+            if not fm:
+                continue
+            fm_slug = str(fm.get("slug") or "").strip()
+            if fm_slug != candidate_slug:
+                continue
+            doc_id = fm.get("id") if fm.get("id") is not None else fm.get("yuque_id")
+            if isinstance(doc_id, int):
+                return doc_id, "slug-frontmatter-scan"
+            if isinstance(doc_id, str) and doc_id.isdigit():
+                return int(doc_id), "slug-frontmatter-scan"
+    return None, "unresolved"
+
+
+def _append_pending_push_event(output_dir: Path, event: Dict[str, Any]) -> None:
+    """将失败事件落盘为 JSONL，便于后续重放。"""
+    p = output_dir / PENDING_PUSH_FILE
+    payload = {"ts": datetime.now(timezone.utc).isoformat(), **event}
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception as e:
+        logger.warning("write pending push queue failed: %s", e)
+
+
+def _replay_dedup_key(evt: Dict[str, Any]) -> str:
+    """重放去重键：type + yuque_id + commit + target。"""
+    t = evt.get("type") or ""
+    yid = evt.get("yuque_id") or evt.get("raw_yuque_id") or ""
+    commit = evt.get("commit") or ""
+    target = ""
+    if "target_channel" in evt or "target_to" in evt:
+        target = f"{evt.get('target_channel', '')}:{evt.get('target_to', '')}"
+    elif evt.get("request_body"):
+        rb = evt["request_body"]
+        target = f"{rb.get('channel', '')}:{rb.get('to', '')}"
+    return f"{t}|{yid}|{commit}|{target}"
+
+
+def _append_replay_status(output_dir: Path, result: Dict[str, Any]) -> None:
+    """追加重放结果行（仅追加，不修改原行）。"""
+    p = output_dir / PENDING_PUSH_FILE
+    payload = {"ts": datetime.now(timezone.utc).isoformat(), **result}
+    try:
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception as e:
+        logger.warning("append replay status failed: %s", e)
+
+
+async def _replay_pending_async(output_dir: Path, limit: int) -> Tuple[int, int, int]:
+    """
+    读取 pending JSONL，按类型重放 mark_pushed_invalid_* 与 openclaw_*_failed，追加 status 行。
+    返回 (done_count, retry_failed_count, invalid_payload_count)。
+    使用文件锁防多实例；按 type+yuque_id+commit+target 去重；4xx 标 invalid_payload，网络/5xx/429 指数退避。
+    """
+    p = output_dir / PENDING_PUSH_FILE
+    if not p.exists():
+        logger.info("replay: no pending file %s", p)
+        return 0, 0, 0
+
+    lock_path = output_dir / PENDING_REPLAY_LOCK_FILE
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        lock_f = open(lock_path, "a")
+    except OSError as e:
+        logger.error("replay: cannot open lock file %s: %s", lock_path, e)
+        return 0, 0, 0
+
+    try:
+        fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+    except OSError as e:
+        logger.error("replay: cannot acquire lock: %s", e)
+        lock_f.close()
+        return 0, 0, 0
+
+    done_keys: set = set()
+    replay_candidates: List[Dict[str, Any]] = []
+    seen_keys: set = set()
+
+    try:
+        lines = p.read_text(encoding="utf-8").strip().split("\n")
+    except Exception as e:
+        logger.error("replay: read pending file failed: %s", e)
+        fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
+        lock_f.close()
+        return 0, 0, 0
+
+    for raw in lines:
+        if not raw.strip():
+            continue
+        try:
+            row = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if row.get("status") == "done" and row.get("dedup_key"):
+            done_keys.add(row["dedup_key"])
+        if row.get("status") == "invalid_payload" and row.get("dedup_key"):
+            done_keys.add(row["dedup_key"])
+
+    for raw in lines:
+        if not raw.strip():
+            continue
+        try:
+            row = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if row.get("status") in ("done", "invalid_payload"):
+            continue
+        t = row.get("type") or ""
+        if not (t.startswith("mark_pushed_invalid_") or t in (
+            "openclaw_callback_delivery_failed",
+            "openclaw_callback_exception",
+            "openclaw_summary_delivery_failed",
+            "openclaw_summary_delivery_exception",
+        )):
+            continue
+        if t == "openclaw_callback_exception":
+            continue
+        key = _replay_dedup_key(row)
+        if key in done_keys or key in seen_keys:
+            continue
+        seen_keys.add(key)
+        replay_candidates.append(row)
+        if len(replay_candidates) >= limit:
+            break
+
+    done_count = 0
+    retry_failed_count = 0
+    invalid_count = 0
+    max_backoff_attempts = 3
+    headers = {}
+    if OPENCLAW_HOOKS_TOKEN:
+        headers["Authorization"] = f"Bearer {OPENCLAW_HOOKS_TOKEN}"
+
+    for evt in replay_candidates:
+        key = _replay_dedup_key(evt)
+        t = evt.get("type") or ""
+        attempt = 0
+        last_status = None
+        last_reason = ""
+
+        if t.startswith("mark_pushed_invalid_"):
+            if t == "mark_pushed_invalid_yuque_id":
+                body = {
+                    "yuque_id": evt.get("raw_yuque_id"),
+                    "commit": evt.get("commit", ""),
+                    "should_push": False,
+                    "repo_slug": evt.get("repo_slug"),
+                    "doc_slug": evt.get("doc_slug"),
+                }
+            else:
+                body = {
+                    "yuque_id": evt.get("yuque_id"),
+                    "commit": evt.get("commit", ""),
+                    "should_push": True,
+                    "summary": evt.get("raw_summary"),
+                }
+            while attempt <= max_backoff_attempts:
+                attempt += 1
+                try:
+                    async with httpx.AsyncClient(timeout=15.0) as client:
+                        r = await client.post(
+                            f"{REPLAY_MARK_PUSHED_BASE_URL}/mark-pushed",
+                            json=body,
+                        )
+                    last_status = r.status_code
+                    if 200 <= r.status_code < 300:
+                        _append_replay_status(output_dir, {"status": "done", "dedup_key": key, "event_type": t})
+                        done_count += 1
+                        logger.info(
+                            "replay event_type=%s reason=ok attempt=%s next_action=done",
+                            t, attempt, extra={"event_type": t, "reason": "ok", "attempt": attempt, "next_action": "done"},
+                        )
+                        break
+                    if 400 <= r.status_code < 500:
+                        last_reason = f"http_{r.status_code}"
+                        _append_replay_status(
+                            output_dir,
+                            {"status": "invalid_payload", "dedup_key": key, "event_type": t, "reason": last_reason},
+                        )
+                        invalid_count += 1
+                        logger.warning(
+                            "replay event_type=%s reason=%s attempt=%s next_action=invalid_payload",
+                            t, last_reason, attempt,
+                            extra={"event_type": t, "reason": last_reason, "attempt": attempt, "next_action": "invalid_payload"},
+                        )
+                        break
+                    last_reason = f"http_{r.status_code}"
+                except (httpx.TimeoutException, httpx.RequestError) as e:
+                    last_reason = f"request_error:{type(e).__name__}"
+                if attempt <= max_backoff_attempts:
+                    wait = 2 ** (attempt - 1)
+                    logger.warning(
+                        "replay event_type=%s reason=%s attempt=%s next_action=retry_after_%ss",
+                        t, last_reason, attempt, wait,
+                        extra={"event_type": t, "reason": last_reason, "attempt": attempt, "next_action": f"retry_after_{wait}s"},
+                    )
+                    await asyncio.sleep(wait)
+            else:
+                _append_replay_status(
+                    output_dir,
+                    {"status": "retry_failed", "dedup_key": key, "event_type": t, "reason": last_reason},
+                )
+                retry_failed_count += 1
+                logger.warning(
+                    "replay event_type=%s reason=%s attempt=%s next_action=retry_failed",
+                    t, last_reason, attempt,
+                    extra={"event_type": t, "reason": last_reason, "attempt": attempt, "next_action": "retry_failed"},
+                )
+            continue
+
+        if t in ("openclaw_callback_delivery_failed", "openclaw_summary_delivery_failed", "openclaw_summary_delivery_exception"):
+            if t in ("openclaw_summary_delivery_failed", "openclaw_summary_delivery_exception") and YUQUE2GIT_DIRECT_SEND_URL:
+                summary = evt.get("summary")
+                if summary and isinstance(summary, dict):
+                    if await _deliver_openclaw_summary(summary):
+                        _append_replay_status(output_dir, {"status": "done", "dedup_key": key, "event_type": t})
+                        done_count += 1
+                        logger.info("replay event_type=%s direct_send=ok", t, extra={"event_type": t})
+                        continue
+                _append_replay_status(output_dir, {"status": "retry_failed", "dedup_key": key, "event_type": t, "reason": "direct_send_failed"})
+                retry_failed_count += 1
+                continue
+            if not OPENCLAW_CALLBACK_URL:
+                _append_replay_status(
+                    output_dir,
+                    {"status": "retry_failed", "dedup_key": key, "event_type": t, "reason": "OPENCLAW_CALLBACK_URL_unset"},
+                )
+                retry_failed_count += 1
+                continue
+            req_body = evt.get("request_body")
+            if not req_body and t == "openclaw_summary_delivery_exception":
+                summary = evt.get("summary")
+                if summary and isinstance(summary, dict):
+                    message = _format_openclaw_summary(summary)
+                    targets = _parse_deliver_targets()
+                    if targets:
+                        req_body = {"message": message, "name": "yuque2git", "deliver": True, "channel": targets[0]["channel"], "to": targets[0]["to"]}
+            if not req_body:
+                _append_replay_status(
+                    output_dir,
+                    {"status": "retry_failed", "dedup_key": key, "event_type": t, "reason": "no_request_body"},
+                )
+                retry_failed_count += 1
+                continue
+            if t == "openclaw_callback_delivery_failed" and isinstance(req_body, dict):
+                bodies = [req_body]
+            elif isinstance(req_body, dict) and "channel" in req_body and "to" in req_body:
+                bodies = [req_body]
+            else:
+                bodies = [req_body] if isinstance(req_body, dict) else []
+
+            openclaw_done = False
+            last_reason = ""
+            attempt = 0
+            for b in bodies:
+                attempt = 0
+                while attempt <= max_backoff_attempts:
+                    attempt += 1
+                    try:
+                        async with httpx.AsyncClient(timeout=15.0) as client:
+                            r = await client.post(OPENCLAW_CALLBACK_URL, json=b, headers=headers or None)
+                        last_status = r.status_code
+                        if 200 <= r.status_code < 300:
+                            _append_replay_status(output_dir, {"status": "done", "dedup_key": key, "event_type": t})
+                            done_count += 1
+                            openclaw_done = True
+                            logger.info(
+                                "replay event_type=%s reason=ok attempt=%s next_action=done",
+                                t, attempt, extra={"event_type": t, "reason": "ok", "attempt": attempt, "next_action": "done"},
+                            )
+                            break
+                        if 400 <= r.status_code < 500:
+                            last_reason = f"http_{r.status_code}"
+                            _append_replay_status(
+                                output_dir,
+                                {"status": "invalid_payload", "dedup_key": key, "event_type": t, "reason": last_reason},
+                            )
+                            invalid_count += 1
+                            logger.warning(
+                                "replay event_type=%s reason=%s attempt=%s next_action=invalid_payload",
+                                t, last_reason, attempt,
+                                extra={"event_type": t, "reason": last_reason, "attempt": attempt, "next_action": "invalid_payload"},
+                            )
+                            openclaw_done = True
+                            break
+                        last_reason = f"http_{r.status_code}"
+                    except (httpx.TimeoutException, httpx.RequestError) as e:
+                        last_reason = f"request_error:{type(e).__name__}"
+                    if attempt <= max_backoff_attempts:
+                        wait = 2 ** (attempt - 1)
+                        await asyncio.sleep(wait)
+                if openclaw_done:
+                    break
+            if not openclaw_done:
+                _append_replay_status(
+                    output_dir,
+                    {"status": "retry_failed", "dedup_key": key, "event_type": t, "reason": last_reason},
+                )
+                retry_failed_count += 1
+                logger.warning(
+                    "replay event_type=%s reason=%s next_action=retry_failed",
+                    t, last_reason,
+                    extra={"event_type": t, "reason": last_reason, "attempt": attempt, "next_action": "retry_failed"},
+                )
+            continue
+
+    try:
+        fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+    lock_f.close()
+    logger.info(
+        "replay finished done=%s retry_failed=%s invalid_payload=%s",
+        done_count, retry_failed_count, invalid_count,
+    )
+    return done_count, retry_failed_count, invalid_count
+
+
 def _extract_body(md_text: str) -> str:
     """从 Markdown 中取出正文：去掉 YAML frontmatter 与元数据表格。"""
     if not md_text or "---" not in md_text:
@@ -790,7 +1180,7 @@ def _build_openclaw_reply_contract(title: str, doc_url: str, deliver_targets: Li
         "}\n"
         "要求：\n"
         "- title、repo_name、author、doc_url 必须非空。\n"
-        "- highlights 必须是 1～3 条字符串，每条都要写清楚具体改了什么。\n"
+        "- highlights 必须是 1～3 条字符串，每条都要写清楚具体改了什么；建议 2～3 条要点，避免仅一条笼统概括导致推送内容过简。\n"
         "- 禁止返回额外说明、Markdown 代码块或自然语言正文。"
     )
 
@@ -830,15 +1220,24 @@ def _validate_openclaw_summary(summary: Optional[Dict[str, Any]]) -> Optional[Di
 
 
 def _format_openclaw_summary(summary: Dict[str, Any]) -> str:
-    """将结构化摘要渲染为最终投递文案。"""
-    lines = [
-        f"【已更新】《{summary['title']}》",
-        f"知识库：{summary['repo_name']}",
-        f"作者：{summary['author']}",
-        f"原文：{summary['doc_url']}",
-        "摘要：",
-    ]
-    lines.extend(f"{idx}. {item}" for idx, item in enumerate(summary["highlights"], start=1))
+    """将结构化摘要渲染为最终投递文案，统一包含：标题、作者、知识库、编号要点、原文链接。"""
+    author = (summary.get("author") or "").strip()
+    title = (summary.get("title") or "").strip()
+    repo_name = (summary.get("repo_name") or "").strip()
+    doc_url = (summary.get("doc_url") or "").strip()
+    highlights = list(summary.get("highlights") or [])
+    lines = ["语雀文档更新通知：", ""]
+    if author and title:
+        repo_part = f"（知识库：{repo_name}）" if repo_name else ""
+        lines.append(f"{author} 更新了《{title}》{repo_part}，主要变更如下：")
+    else:
+        lines.append(f"《{title or '文档'}》更新，主要变更如下：")
+    lines.append("")
+    for idx, item in enumerate(highlights, start=1):
+        lines.append(f"{idx}. {item}")
+    if doc_url:
+        lines.append("")
+        lines.append(f"原文：{doc_url}")
     return "\n".join(lines)
 
 
@@ -966,6 +1365,44 @@ def _is_openclaw_hooks_agent_url(url: str) -> bool:
     return u.endswith("/hooks/agent")
 
 
+async def _send_napcat_message(client: httpx.AsyncClient, channel: str, to: str, message: str) -> bool:
+    """直连 Napcat OneBot 11 API 发群消息或私聊。channel=qq，to 为 g:群号 或 p:QQ号。返回是否发送成功。"""
+    if not YUQUE2GIT_DIRECT_SEND_URL or channel != "qq" or not to or not message:
+        return False
+    to = to.strip()
+    base = YUQUE2GIT_DIRECT_SEND_URL
+    headers = {"Content-Type": "application/json"}
+    if YUQUE2GIT_DIRECT_SEND_TOKEN:
+        headers["Authorization"] = f"Bearer {YUQUE2GIT_DIRECT_SEND_TOKEN}"
+    if to.startswith("g:") and to[2:].strip().isdigit():
+        group_id = int(to[2:].strip())
+        url = f"{base}/send_group_msg"
+        body = {"group_id": group_id, "message": message}
+    elif to.startswith("p:") and to[2:].strip().isdigit():
+        user_id = int(to[2:].strip())
+        url = f"{base}/send_private_msg"
+        body = {"user_id": user_id, "message": message}
+    else:
+        logger.warning("Direct send: unsupported target channel=%r to=%r", channel, to)
+        return False
+    try:
+        r = await client.post(url, json=body, headers=headers)
+        if r.status_code >= 400:
+            logger.warning("Napcat direct send %s/%s returned %s: %s", channel, to, r.status_code, (r.text or "")[:200])
+            return False
+        try:
+            data = r.json() if r.content else {}
+        except Exception:
+            data = {}
+        ok = data.get("status") == "ok" or data.get("retcode") == 0
+        if not ok:
+            logger.warning("Napcat direct send %s/%s API result: %s", channel, to, data)
+        return ok
+    except Exception as e:
+        logger.warning("Napcat direct send failed: %s", e)
+        return False
+
+
 def _doc_url(namespace: str, repo_slug: str, doc_slug: str) -> str:
     """语雀文档原文地址。base 从 YUQUE_BASE_URL 推导（如 nova.yuque.com）。"""
     base = YUQUE_BASE_URL.replace("/api/v2", "").rstrip("/") or "https://nova.yuque.com"
@@ -1053,29 +1490,48 @@ async def _openclaw_callback(
         }
         headers = {}
         bodies = [body]
-    async def _post_with_retry(client: httpx.AsyncClient, b: Dict, channel: str, to: str) -> None:
-        last_exc = None
+    async def _post_with_retry(client: httpx.AsyncClient, b: Dict, channel: str, to: str) -> Tuple[bool, str]:
+        """返回 (ok, reason)。"""
+        last_reason = "unknown"
         for attempt in range(YUQUE2GIT_DELIVER_MAX_RETRIES + 1):
-            r = await client.post(OPENCLAW_CALLBACK_URL, json=b, headers=headers or None)
-            if r.status_code == 429 and attempt < YUQUE2GIT_DELIVER_MAX_RETRIES:
-                wait = 2 ** attempt
-                if "Retry-After" in r.headers:
-                    try:
-                        wait = int(r.headers["Retry-After"])
-                    except ValueError:
-                        pass
-                logger.warning(
-                    "OpenClaw deliver 429 (target %s/%s), retry after %ss (attempt %s/%s)",
-                    channel, to, wait, attempt + 1, YUQUE2GIT_DELIVER_MAX_RETRIES + 1,
-                )
-                await asyncio.sleep(wait)
-                last_exc = httpx.HTTPStatusError("429 Too Many Requests", request=r.request, response=r)
-                continue
-            if r.status_code >= 400:
+            try:
+                r = await client.post(OPENCLAW_CALLBACK_URL, json=b, headers=headers or None)
+            except (httpx.TimeoutException, httpx.RequestError) as e:
+                last_reason = f"request_error:{type(e).__name__}"
+                if attempt < YUQUE2GIT_DELIVER_MAX_RETRIES:
+                    wait = 2 ** attempt
+                    logger.warning(
+                        "OpenClaw POST request error (target %s/%s), retry after %ss (attempt %s/%s): %s",
+                        channel, to, wait, attempt + 1, YUQUE2GIT_DELIVER_MAX_RETRIES + 1, e,
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+                return False, last_reason
+
+            if r.status_code == 429 or r.status_code >= 500:
+                last_reason = f"http_{r.status_code}"
+                if attempt < YUQUE2GIT_DELIVER_MAX_RETRIES:
+                    wait = 2 ** attempt
+                    if "Retry-After" in r.headers:
+                        try:
+                            wait = int(r.headers["Retry-After"])
+                        except ValueError:
+                            pass
+                    logger.warning(
+                        "OpenClaw POST %s (target %s/%s), retry after %ss (attempt %s/%s)",
+                        r.status_code, channel, to, wait, attempt + 1, YUQUE2GIT_DELIVER_MAX_RETRIES + 1,
+                    )
+                    await asyncio.sleep(wait)
+                    continue
                 logger.warning("OpenClaw POST target %s/%s returned %s: %s", channel, to, r.status_code, (r.text or "")[:200])
-            return
-        if last_exc:
-            logger.warning("OpenClaw deliver failed after retries: %s", last_exc)
+                return False, last_reason
+
+            if r.status_code >= 400:
+                last_reason = f"http_{r.status_code}"
+                logger.warning("OpenClaw POST target %s/%s returned %s: %s", channel, to, r.status_code, (r.text or "")[:200])
+                return False, last_reason
+            return True, "ok"
+        return False, last_reason
 
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
@@ -1086,19 +1542,105 @@ async def _openclaw_callback(
                 to = b.get("to", "")
                 if channel or to:
                     logger.info("OpenClaw deliver target %s/%s (request %d/%d)", channel, to, i + 1, len(bodies))
-                await _post_with_retry(client, b, channel, to)
+                ok, reason = await _post_with_retry(client, b, channel, to)
+                if not ok and OUTPUT_DIR:
+                    _append_pending_push_event(
+                        OUTPUT_DIR,
+                        {
+                            "type": "openclaw_callback_delivery_failed",
+                            "reason": reason,
+                            "target_channel": channel,
+                            "target_to": to,
+                            "repo_slug": repo_slug,
+                            "doc_slug": doc_slug,
+                            "yuque_id": yuque_id,
+                            "commit": commit,
+                            "request_body": b,
+                            "next_action": "replay_needed",
+                        },
+                    )
     except Exception as e:
         logger.warning("OpenClaw callback POST failed: %s", e)
+        if OUTPUT_DIR:
+            _append_pending_push_event(
+                OUTPUT_DIR,
+                {
+                    "type": "openclaw_callback_exception",
+                    "reason": type(e).__name__,
+                    "repo_slug": repo_slug,
+                    "doc_slug": doc_slug,
+                    "yuque_id": yuque_id,
+                    "commit": commit,
+                    "next_action": "replay_needed",
+                },
+            )
 
 
-async def _deliver_openclaw_summary(summary: Dict[str, Any]) -> None:
-    """将服务端拼装好的摘要通过 Gateway 投递给配置目标。"""
-    if not _is_openclaw_hooks_agent_url(OPENCLAW_CALLBACK_URL):
-        return
+async def _deliver_openclaw_summary(summary: Dict[str, Any]) -> bool:
+    """将服务端拼装好的摘要投递给配置目标。若配置了直连 URL 则走 Napcat；否则走 Gateway。返回是否全部投递成功。"""
     deliver_targets = _parse_deliver_targets()
     if not deliver_targets:
-        return
+        return False
     message = _format_openclaw_summary(summary)
+
+    if YUQUE2GIT_DIRECT_SEND_URL:
+        # 直连 Napcat：仅支持 channel=qq，to 为 g:群号 或 p:QQ号
+        valid = []
+        for t in deliver_targets:
+            channel, to = t.get("channel", "").strip(), t.get("to", "").strip()
+            if channel != "qq":
+                logger.warning("Direct send: skipping non-qq target %s/%s", channel, to)
+                continue
+            if not (to.startswith("g:") or to.startswith("p:")) or not (to[2:].strip().isdigit()):
+                logger.warning("Direct send: skipping unsupported to %r", to)
+                continue
+            valid.append({"channel": channel, "to": to})
+        if not valid:
+            return False
+        all_ok = True
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                for i, t in enumerate(valid):
+                    if i > 0 and YUQUE2GIT_DELIVER_DELAY_SECONDS > 0 and len(valid) > 1:
+                        await asyncio.sleep(YUQUE2GIT_DELIVER_DELAY_SECONDS)
+                    channel, to = t["channel"], t["to"]
+                    last_reason = "unknown"
+                    for attempt in range(YUQUE2GIT_DELIVER_MAX_RETRIES + 1):
+                        try:
+                            ok = await _send_napcat_message(client, channel, to, message)
+                        except (httpx.TimeoutException, httpx.RequestError) as e:
+                            last_reason = f"request_error:{type(e).__name__}"
+                            if attempt < YUQUE2GIT_DELIVER_MAX_RETRIES:
+                                wait = 2 ** attempt
+                                logger.warning("Direct send retry after %ss (attempt %s/%s): %s", wait, attempt + 1, YUQUE2GIT_DELIVER_MAX_RETRIES + 1, e)
+                                await asyncio.sleep(wait)
+                                continue
+                            all_ok = False
+                            if OUTPUT_DIR:
+                                _append_pending_push_event(OUTPUT_DIR, {"type": "openclaw_summary_delivery_exception", "reason": last_reason, "summary": summary, "target_channel": channel, "target_to": to, "next_action": "replay_needed"})
+                            break
+                        if not ok:
+                            last_reason = "napcat_api_failed"
+                            if attempt < YUQUE2GIT_DELIVER_MAX_RETRIES:
+                                wait = 2 ** attempt
+                                logger.warning("Direct send %s/%s failed, retry after %ss (attempt %s/%s)", channel, to, wait, attempt + 1, YUQUE2GIT_DELIVER_MAX_RETRIES + 1)
+                                await asyncio.sleep(wait)
+                                continue
+                            all_ok = False
+                            if OUTPUT_DIR:
+                                _append_pending_push_event(OUTPUT_DIR, {"type": "openclaw_summary_delivery_failed", "reason": last_reason, "summary": summary, "target_channel": channel, "target_to": to, "next_action": "replay_needed"})
+                            break
+                        logger.info("Direct send summary delivered to %s/%s", channel, to)
+                        break
+        except Exception as e:
+            logger.warning("Direct send summary deliver failed: %s", e)
+            all_ok = False
+            if OUTPUT_DIR:
+                _append_pending_push_event(OUTPUT_DIR, {"type": "openclaw_summary_delivery_exception", "reason": type(e).__name__, "summary": summary, "next_action": "replay_needed"})
+        return all_ok
+
+    if not _is_openclaw_hooks_agent_url(OPENCLAW_CALLBACK_URL):
+        return False
     headers = {}
     if OPENCLAW_HOOKS_TOKEN:
         headers["Authorization"] = f"Bearer {OPENCLAW_HOOKS_TOKEN}"
@@ -1106,18 +1648,71 @@ async def _deliver_openclaw_summary(summary: Dict[str, Any]) -> None:
         {"message": message, "name": "yuque2git", "deliver": True, "channel": t["channel"], "to": t["to"]}
         for t in deliver_targets
     ]
+    all_ok = True
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             for i, body in enumerate(bodies):
                 if i > 0 and YUQUE2GIT_DELIVER_DELAY_SECONDS > 0 and len(bodies) > 1:
                     await asyncio.sleep(YUQUE2GIT_DELIVER_DELAY_SECONDS)
-                await client.post(OPENCLAW_CALLBACK_URL, json=body, headers=headers or None)
+                last_reason = "unknown"
+                for attempt in range(YUQUE2GIT_DELIVER_MAX_RETRIES + 1):
+                    try:
+                        r = await client.post(OPENCLAW_CALLBACK_URL, json=body, headers=headers or None)
+                    except (httpx.TimeoutException, httpx.RequestError) as e:
+                        last_reason = f"request_error:{type(e).__name__}"
+                        if attempt < YUQUE2GIT_DELIVER_MAX_RETRIES:
+                            wait = 2 ** attempt
+                            logger.warning("OpenClaw summary deliver retry after %ss (attempt %s/%s): %s", wait, attempt + 1, YUQUE2GIT_DELIVER_MAX_RETRIES + 1, e)
+                            await asyncio.sleep(wait)
+                            continue
+                        all_ok = False
+                        if OUTPUT_DIR:
+                            _append_pending_push_event(OUTPUT_DIR, {"type": "openclaw_summary_delivery_exception", "reason": last_reason, "summary": summary, "request_body": body, "next_action": "replay_needed"})
+                        break
+                    if r.status_code == 429 or r.status_code >= 500:
+                        last_reason = f"http_{r.status_code}"
+                        if attempt < YUQUE2GIT_DELIVER_MAX_RETRIES:
+                            wait = 2 ** attempt
+                            logger.warning("OpenClaw summary deliver %s, retry after %ss (attempt %s/%s)", r.status_code, wait, attempt + 1, YUQUE2GIT_DELIVER_MAX_RETRIES + 1)
+                            await asyncio.sleep(wait)
+                            continue
+                        all_ok = False
+                        logger.warning("OpenClaw summary deliver returned %s: %s", r.status_code, (r.text or "")[:200])
+                        if OUTPUT_DIR:
+                            _append_pending_push_event(OUTPUT_DIR, {"type": "openclaw_summary_delivery_failed", "reason": last_reason, "summary": summary, "request_body": body, "next_action": "replay_needed"})
+                        break
+                    if r.status_code >= 400:
+                        all_ok = False
+                        logger.warning("OpenClaw summary deliver returned %s: %s", r.status_code, (r.text or "")[:200])
+                        if OUTPUT_DIR:
+                            _append_pending_push_event(OUTPUT_DIR, {"type": "openclaw_summary_delivery_failed", "reason": f"http_{r.status_code}", "summary": summary, "request_body": body, "next_action": "replay_needed"})
+                        break
+                    logger.info("OpenClaw summary delivered to %s/%s (status=%s)", body.get("channel"), body.get("to"), r.status_code)
+                    break
     except Exception as e:
         logger.warning("OpenClaw summary deliver failed: %s", e)
+        all_ok = False
+        if OUTPUT_DIR:
+            _append_pending_push_event(OUTPUT_DIR, {"type": "openclaw_summary_delivery_exception", "reason": type(e).__name__, "summary": summary, "next_action": "replay_needed"})
+    return all_ok
 
 
 # --- FastAPI ---
 app = FastAPI(title="yuque2git Webhook")
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(_request: Request, exc: RequestValidationError):
+    """将 /mark-pushed 等接口的 422 校验错误写入日志，便于排查 Agent 回调格式问题。"""
+    path = getattr(_request, "url", None) and getattr(_request.url, "path", "") or ""
+    if "/mark-pushed" in path:
+        logger.warning(
+            "mark-pushed 422: request body validation failed. path=%s errors=%s example={\"yuque_id\":261997991,\"commit\":\"<sha>\",\"should_push\":true,\"summary\":{\"title\":\"...\",\"repo_name\":\"...\",\"author\":\"...\",\"doc_url\":\"https://...\",\"highlights\":[\"...\"]}}",
+            path,
+            exc.errors(),
+        )
+    from fastapi.responses import JSONResponse
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
 
 @app.get("/health")
@@ -1129,6 +1724,38 @@ async def health():
 async def mark_pushed(body: MarkPushedBody):
     if not OUTPUT_DIR or not OUTPUT_DIR.is_dir():
         return Response(status_code=500, content="OUTPUT_DIR not configured or missing")
+    resolved_yuque_id, resolve_source = _resolve_yuque_id_for_mark_pushed(
+        OUTPUT_DIR, body.yuque_id, body.repo_slug, body.doc_slug
+    )
+    if resolved_yuque_id is None:
+        logger.warning(
+            "mark-pushed rejected: invalid yuque_id=%r (repo_slug=%r, doc_slug=%r). "
+            "Expected integer yuque_id or resolvable slug.",
+            body.yuque_id,
+            body.repo_slug,
+            body.doc_slug,
+        )
+        _append_pending_push_event(
+            OUTPUT_DIR,
+            {
+                "type": "mark_pushed_invalid_yuque_id",
+                "raw_yuque_id": body.yuque_id,
+                "repo_slug": body.repo_slug,
+                "doc_slug": body.doc_slug,
+                "commit": body.commit,
+                "reason": "unresolvable_yuque_id",
+                "next_action": "fix_payload_and_replay",
+            },
+        )
+        return Response(status_code=400, content="invalid yuque_id (expect integer or resolvable slug)")
+    if resolve_source not in ("int", "numeric-string"):
+        logger.warning(
+            "mark-pushed compat-resolve: yuque_id=%r -> %s via %s",
+            body.yuque_id,
+            resolved_yuque_id,
+            resolve_source,
+        )
+
     if body.should_push and body.commit:
         r = subprocess.run(
             ["git", "rev-parse", "--verify", body.commit],
@@ -1139,14 +1766,33 @@ async def mark_pushed(body: MarkPushedBody):
             return Response(status_code=400, content="commit not found in repo")
     validated_summary = _validate_openclaw_summary(body.summary) if body.should_push else None
     if body.should_push and not validated_summary:
+        logger.warning(
+            "mark-pushed rejected: summary missing or invalid (yuque_id=%s, should_push=true). "
+            "summary must be dict with title, repo_name, author, doc_url, highlights (1～3 items).",
+            resolved_yuque_id,
+        )
+        _append_pending_push_event(
+            OUTPUT_DIR,
+            {
+                "type": "mark_pushed_invalid_summary",
+                "yuque_id": resolved_yuque_id,
+                "commit": body.commit,
+                "reason": "summary_missing_or_invalid",
+                "raw_summary": body.summary,
+                "next_action": "fix_payload_and_replay",
+            },
+        )
         return Response(status_code=400, content="summary missing or invalid")
     if body.should_push:
         data = _read_last_push(OUTPUT_DIR)
-        data[str(body.yuque_id)] = body.commit
+        # 幂等：该 commit 已记录并推送过则不再重复 deliver，避免同文档短时多次推送
+        if data.get(str(resolved_yuque_id)) == body.commit:
+            return {"ok": True, "yuque_id": resolved_yuque_id, "commit": body.commit, "delivered": False}
+        data[str(resolved_yuque_id)] = body.commit
         _write_last_push(OUTPUT_DIR, data)
-        await _deliver_openclaw_summary(validated_summary)
-        return {"ok": True, "yuque_id": body.yuque_id, "commit": body.commit, "delivered": True}
-    return {"ok": True, "yuque_id": body.yuque_id, "commit": body.commit, "delivered": False}
+        delivered = await _deliver_openclaw_summary(validated_summary)
+        return {"ok": True, "yuque_id": resolved_yuque_id, "commit": body.commit, "delivered": delivered}
+    return {"ok": True, "yuque_id": resolved_yuque_id, "commit": body.commit, "delivered": False}
 
 
 @app.post("/webhook")
@@ -1325,7 +1971,7 @@ async def webhook(request: Request):
 
 
 def main():
-    global OUTPUT_DIR
+    global OUTPUT_DIR, _WEBHOOK_LOG_FILE
     parser = argparse.ArgumentParser(description="yuque2git Webhook server")
     parser.add_argument(
         "--output-dir",
@@ -1335,11 +1981,45 @@ def main():
     )
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--bind", type=str, default="0.0.0.0")
+    parser.add_argument(
+        "--log-file",
+        type=Path,
+        default=None,
+        help="Webhook 业务日志文件路径（接收/commit/推送判定），不设则仅 stdout",
+    )
+    parser.add_argument(
+        "--replay-pending",
+        action="store_true",
+        help="一次性重放 pending 队列后退出，不启动 HTTP 服务",
+    )
+    parser.add_argument(
+        "--replay-limit",
+        type=int,
+        default=50,
+        help="重放时最多处理条数（默认 50），仅与 --replay-pending 同用",
+    )
     args = parser.parse_args()
     if not args.output_dir:
         parser.error("请指定 --output-dir 或设置环境变量 OUTPUT_DIR")
     OUTPUT_DIR = Path(args.output_dir).resolve()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    if args.replay_pending:
+        done, retry_failed, invalid = asyncio.run(_replay_pending_async(OUTPUT_DIR, args.replay_limit))
+        logger.info("replay exit: done=%s retry_failed=%s invalid_payload=%s", done, retry_failed, invalid)
+        return
+
+    if args.log_file:
+        _WEBHOOK_LOG_FILE = Path(args.log_file).resolve()
+        try:
+            fh = logging.FileHandler(_WEBHOOK_LOG_FILE, encoding="utf-8")
+            fh.setLevel(logging.INFO)
+            fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+            logger.addHandler(fh)
+            logger.info("Webhook log file: %s", _WEBHOOK_LOG_FILE)
+        except OSError as e:
+            logger.warning("Cannot open log file %s: %s", _WEBHOOK_LOG_FILE, e)
+
     uvicorn.run(app, host=args.bind, port=args.port)
 
 
