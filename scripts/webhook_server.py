@@ -11,6 +11,7 @@ import os
 import re
 import smtplib
 import subprocess
+import zlib
 from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -332,10 +333,111 @@ def _build_md(detail: Dict[str, Any], author_name: str = "") -> str:
     md = "---\n" + yaml_block + "\n---\n\n"
     md += "| 作者 | 创建时间 | 更新时间 |\n|------|----------|----------|\n"
     md += f"| {author_display} | {table_cell(str(created))} | {table_cell(str(updated))} |\n\n"
-    md += (detail.get("body") or "").strip()
+    md += _render_doc_body(detail)
     if not md.endswith("\n"):
         md += "\n"
     return md
+
+
+def _render_doc_body(detail: Dict[str, Any]) -> str:
+    if (detail.get("format") or "").lower() == "lakesheet" or (detail.get("type") or "").lower() == "sheet":
+        rendered = _render_lakesheet_markdown(detail.get("body") or "")
+        if rendered:
+            return rendered
+    return (detail.get("body") or "").strip()
+
+
+def _render_lakesheet_markdown(raw_body: Any) -> str:
+    try:
+        payload = raw_body if isinstance(raw_body, dict) else json.loads(raw_body or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return str(raw_body or "").strip()
+    compressed = payload.get("sheet")
+    if not isinstance(compressed, str) or not compressed:
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+    try:
+        decoded = zlib.decompress(compressed.encode("latin1")).decode("utf-8")
+        sheets = json.loads(decoded)
+    except Exception:
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+    if not isinstance(sheets, list):
+        return decoded.strip()
+
+    blocks: List[str] = [
+        "> Auto-generated from Yuque lakesheet for readable review and diff.",
+        "",
+    ]
+    for idx, sheet in enumerate(sheets, start=1):
+        if not isinstance(sheet, dict):
+            continue
+        title = (sheet.get("name") or f"Sheet{idx}").strip()
+        blocks.append(f"## {title}")
+        blocks.append("")
+        blocks.append("```tsv")
+        blocks.extend(_sheet_to_tsv_lines(sheet))
+        blocks.append("```")
+        blocks.append("")
+    return "\n".join(blocks).strip()
+
+
+def _sheet_to_tsv_lines(sheet: Dict[str, Any]) -> List[str]:
+    data = sheet.get("data")
+    if not isinstance(data, dict) or not data:
+        return ["(empty)"]
+
+    used_rows = set()
+    used_cols = set()
+    for row_key, row in data.items():
+        if not isinstance(row, dict):
+            continue
+        try:
+            row_idx = int(row_key)
+        except (TypeError, ValueError):
+            continue
+        for col_key, cell in row.items():
+            if not isinstance(cell, dict):
+                continue
+            try:
+                col_idx = int(col_key)
+            except (TypeError, ValueError):
+                continue
+            if _cell_has_content(cell):
+                used_rows.add(row_idx)
+                used_cols.add(col_idx)
+
+    if not used_rows or not used_cols:
+        return ["(empty)"]
+
+    max_col = max(used_cols)
+    lines: List[str] = []
+    for row_idx in range(min(used_rows), max(used_rows) + 1):
+        row = data.get(str(row_idx), {})
+        rendered = [_cell_to_text(row.get(str(col_idx))) for col_idx in range(0, max_col + 1)]
+        while rendered and rendered[-1] == "":
+            rendered.pop()
+        lines.append("\t".join(rendered))
+    return lines or ["(empty)"]
+
+
+def _cell_has_content(cell: Dict[str, Any]) -> bool:
+    return _cell_to_text(cell) != ""
+
+
+def _cell_to_text(cell: Any) -> str:
+    if not isinstance(cell, dict):
+        return ""
+    for key in ("m", "v", "f"):
+        value = cell.get(key)
+        if value is None:
+            continue
+        if isinstance(value, (dict, list)):
+            text = json.dumps(value, ensure_ascii=False, sort_keys=True)
+        else:
+            text = str(value)
+        text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\t", " ").strip()
+        if text:
+            return text.replace("\n", "\\n")
+    return ""
 
 
 def _ensure_git(output_dir: Path) -> None:
@@ -353,11 +455,20 @@ def _git_add_commit(output_dir: Path, paths: List[str], message: str) -> Optiona
         cwd=output_dir,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
     if result.returncode != 0 and "nothing to commit" not in (result.stderr or "").lower():
         logger.warning("git commit: %s", result.stderr)
         return None
-    r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=output_dir, capture_output=True, text=True)
+    r = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=output_dir,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
     return r.stdout.strip() if r.returncode == 0 else None
 
 
@@ -527,6 +638,8 @@ def _get_diff(
             cwd=output_dir,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
         new_path = output_dir / rel_path
         new_content = new_path.read_text(encoding="utf-8") if new_path.exists() else ""
@@ -542,6 +655,8 @@ def _get_diff(
             cwd=output_dir,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
         old_content = (r_old.stdout or "") if r_old.returncode == 0 else ""
         new_path = output_dir / rel_path
@@ -554,6 +669,8 @@ def _get_diff(
         cwd=output_dir,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
     if r.returncode != 0:
         full_path = output_dir / rel_path
@@ -986,7 +1103,7 @@ async def webhook(request: Request):
             out_file = repo_dir / parent_path / doc_basename
         else:
             out_file = repo_dir / doc_basename
-        rel_path = str(out_file.relative_to(OUTPUT_DIR))
+        rel_path = out_file.relative_to(OUTPUT_DIR).as_posix()
         _ensure_git(OUTPUT_DIR)
         index = _read_index(OUTPUT_DIR)
         old_path = index.get(str(data.id))

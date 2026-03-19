@@ -7,6 +7,7 @@
 """
 import json
 import subprocess
+import zlib
 from pathlib import Path
 
 import pytest
@@ -22,6 +23,7 @@ from webhook_server import (
     _parent_path_from_toc,
     _build_md,
     _get_diff,
+    _render_lakesheet_markdown,
     _read_last_push,
     _write_last_push,
     _update_last_push_for,
@@ -121,6 +123,46 @@ class TestBuildMd:
         md = _build_md(detail, "名|带竖线")
         assert "\\|" in md or "|" in md
         assert "带竖线" in md or "名" in md
+
+    def test_lakesheet_rendered_as_readable_table(self):
+        sheet = [
+            {
+                "name": "Sheet1",
+                "data": {
+                    "0": {"0": {"v": "学号"}, "1": {"v": "姓名"}, "2": {"v": "校区"}},
+                    "1": {"0": {"v": "1"}, "1": {"v": "张三"}, "2": {"v": "鼓楼"}},
+                    "2": {"0": {"v": "2"}, "1": {"v": "李四"}, "2": {"v": "仙林"}},
+                },
+            }
+        ]
+        payload = {
+            "format": "lakesheet",
+            "version": "3.5.5",
+            "larkJson": True,
+            "sheet": zlib.compress(json.dumps(sheet, ensure_ascii=False).encode("utf-8")).decode("latin1"),
+        }
+        detail = {
+            "id": 123,
+            "title": "活动统计",
+            "slug": "sheet-doc",
+            "type": "Sheet",
+            "format": "lakesheet",
+            "body": json.dumps(payload, ensure_ascii=False),
+            "created_at": "2024-01-01T00:00:00.000Z",
+            "updated_at": "2024-01-02T00:00:00.000Z",
+        }
+        md = _build_md(detail, "作者名")
+        assert "Auto-generated from Yuque lakesheet" in md
+        assert "```tsv" in md
+        assert "学号\t姓名\t校区" in md
+        assert "1\t张三\t鼓楼" in md
+        assert "\"format\": \"lakesheet\"" not in md
+
+
+class TestRenderLakesheetMarkdown:
+    def test_invalid_payload_falls_back_to_raw_text(self):
+        raw = _render_lakesheet_markdown("not-json")
+        assert raw == "not-json"
 
 
 class TestLastPush:
