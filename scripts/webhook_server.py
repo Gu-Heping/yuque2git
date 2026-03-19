@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
+from string import Formatter
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
@@ -108,8 +109,10 @@ class WebhookPayload(BaseModel):
 class MarkPushedBody(BaseModel):
     yuque_id: int
     commit: str
+    should_push: bool = True
     repo_slug: Optional[str] = None
     doc_slug: Optional[str] = None
+    summary: Optional[Dict[str, Any]] = None
 
 
 # --- 语雀 API 客户端 ---
@@ -691,7 +694,11 @@ async def _llm_should_push(diff: str, title: str, repo_name: str) -> tuple[bool,
         return False, None
     summary_instruction = ""
     if ENABLE_UPDATE_SUMMARY:
-        summary_instruction = ' 同时用 1～3 句话生成 "update_summary" 字段，供订阅者快速了解本次变更（若无实质内容可留空）。'
+        summary_instruction = (
+            ' 同时生成 "update_summary" 字段，内容必须是 1～3 句可直接发给订阅者的中文摘要。'
+            ' 只要 should_push=true，update_summary 就必须为非空，且要明确说明改了什么；'
+            ' 只有 should_push=false 时才允许为空字符串。'
+        )
     prompt = f"""你是一个文档推送决策助手。给定「语雀文档自上次推送以来的 diff」和文档标题、知识库名，判断本次变更是否值得向订阅者推送通知。
 
 规则：仅当变更对读者有实质价值（如新增重要内容、修正错误、结构调整）时才返回 should_push=true；仅格式/标点/时间戳等小改动可返回 false。
@@ -707,7 +714,7 @@ Diff（自上次推送以来的变更）：
 请严格返回一个 JSON 对象，且仅此对象，不要其他文字。字段：
 - should_push: boolean
 - reason: string（简短理由）
-{'- update_summary: string（1～3 句变更摘要，可选）' if ENABLE_UPDATE_SUMMARY else ''}
+{'- update_summary: string（1～3 句中文变更摘要；当 should_push=true 时必须非空，当 should_push=false 时可为空字符串）' if ENABLE_UPDATE_SUMMARY else ''}
 """
     messages = [{"role": "user", "content": prompt}]
     payload = {
@@ -738,12 +745,101 @@ Diff（自上次推送以来的变更）：
                 break
     try:
         obj = json.loads(content)
-        should = bool(obj.get("should_push", False))
-        summary = (obj.get("update_summary") or "").strip() if ENABLE_UPDATE_SUMMARY else None
+        should_raw = obj.get("should_push", False)
+        if not isinstance(should_raw, bool):
+            logger.warning("LLM response should_push must be boolean, got %r", should_raw)
+            return False, None
+        should = should_raw
+        summary = None
+        if ENABLE_UPDATE_SUMMARY:
+            summary_raw = obj.get("update_summary", "")
+            if summary_raw is None:
+                summary_raw = ""
+            if not isinstance(summary_raw, str):
+                logger.warning("LLM response update_summary must be string, got %r", type(summary_raw).__name__)
+                return False, None
+            summary = summary_raw.strip()
+            if should and not summary:
+                logger.warning("LLM response missing update_summary while should_push=true")
+                return False, None
         return should, summary
     except json.JSONDecodeError as e:
         logger.warning("LLM response not valid JSON: %s", e)
         return False, None
+
+
+def _build_openclaw_reply_contract(title: str, doc_url: str, deliver_targets: List[Dict[str, str]]) -> str:
+    """统一约束 OpenClaw Agent 的回文格式，尽量提高摘要完整性与稳定性。"""
+    link_placeholder = doc_url or "（未提供原文链接，需按此原样保留）"
+    push_note = "若决定推送，必须先向 /mark-pushed 回调结构化 JSON；不要把摘要直接发给订阅者。"
+    target_note = "服务端会在收到合法 JSON 后统一投递给订阅者。" if deliver_targets else "服务端会在收到合法 JSON 后统一生成摘要。"
+    return (
+        "若决定不推送，请回调 JSON："
+        '{"yuque_id": <yuque_id>, "commit": "<commit>", "should_push": false}。\n'
+        f"{push_note}{target_note}\n"
+        "若决定推送，请回调 JSON，且只能回调这一种结构：\n"
+        "{\n"
+        f'  "yuque_id": <yuque_id>,\n  "commit": "<commit>",\n  "should_push": true,\n'
+        '  "summary": {\n'
+        f'    "title": "{title}",\n'
+        '    "repo_name": "<知识库名>",\n'
+        '    "author": "<作者名>",\n'
+        f'    "doc_url": "{link_placeholder}",\n'
+        '    "highlights": ["<变更要点1>", "<变更要点2，可省略>", "<变更要点3，可省略>"]\n'
+        "  }\n"
+        "}\n"
+        "要求：\n"
+        "- title、repo_name、author、doc_url 必须非空。\n"
+        "- highlights 必须是 1～3 条字符串，每条都要写清楚具体改了什么。\n"
+        "- 禁止返回额外说明、Markdown 代码块或自然语言正文。"
+    )
+
+
+def _render_openclaw_message_template(template: str, values: Dict[str, Any]) -> str:
+    """渲染自定义模板；缺少字段时保守降级为报错，避免静默丢失关键信息。"""
+    required_fields = {name for _, name, _, _ in Formatter().parse(template) if name}
+    missing = sorted(name for name in required_fields if name not in values)
+    if missing:
+        raise ValueError(f"OpenClaw message template references unknown fields: {', '.join(missing)}")
+    return template.format(**values)
+
+
+def _validate_openclaw_summary(summary: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """校验 OpenClaw 回传的结构化摘要；不合法时返回 None。"""
+    if not isinstance(summary, dict):
+        return None
+    title = str(summary.get("title") or "").strip()
+    repo_name = str(summary.get("repo_name") or "").strip()
+    author = str(summary.get("author") or "").strip()
+    doc_url = str(summary.get("doc_url") or "").strip()
+    highlights_raw = summary.get("highlights")
+    if not title or not repo_name or not author or not doc_url:
+        return None
+    if not isinstance(highlights_raw, list):
+        return None
+    highlights = [str(item).strip() for item in highlights_raw if str(item).strip()]
+    if not 1 <= len(highlights) <= 3:
+        return None
+    return {
+        "title": title,
+        "repo_name": repo_name,
+        "author": author,
+        "doc_url": doc_url,
+        "highlights": highlights,
+    }
+
+
+def _format_openclaw_summary(summary: Dict[str, Any]) -> str:
+    """将结构化摘要渲染为最终投递文案。"""
+    lines = [
+        f"【已更新】《{summary['title']}》",
+        f"知识库：{summary['repo_name']}",
+        f"作者：{summary['author']}",
+        f"原文：{summary['doc_url']}",
+        "摘要：",
+    ]
+    lines.extend(f"{idx}. {item}" for idx, item in enumerate(summary["highlights"], start=1))
+    return "\n".join(lines)
 
 
 def _update_last_push_for(output_dir: Path, yuque_id: int, commit: str) -> None:
@@ -897,38 +993,37 @@ async def _openclaw_callback(
     # 供 Agent 直接读取的本地绝对路径（与 OUTPUT_DIR 同机时可用 read 工具）
     local_path_abs = str(OUTPUT_DIR / local_path) if (OUTPUT_DIR and local_path) else local_path
     if _is_openclaw_hooks_agent_url(OPENCLAW_CALLBACK_URL):
+        deliver_targets = _parse_deliver_targets()
         callback_instruction = (
-            f"若决定推送，请向以下 URL 发送 POST 请求：{YUQUE2GIT_PUBLIC_URL.rstrip('/')}/mark-pushed，"
-            f"Body JSON：{{\"yuque_id\": {yuque_id}, \"commit\": \"{commit}\"}}。"
+            f"请向以下 URL 发送 POST 请求：{YUQUE2GIT_PUBLIC_URL.rstrip('/')}/mark-pushed，"
+            f"Body JSON 必须包含 yuque_id、commit、should_push；若 should_push=true，还必须携带 summary。"
             if YUQUE2GIT_PUBLIC_URL
-            else "若决定推送，请向部署本 yuque2git 服务的 /mark-pushed 发起 POST，Body JSON 含 yuque_id 与 commit。"
+            else "请向部署本 yuque2git 服务的 /mark-pushed 发起 POST，Body JSON 必须包含 yuque_id、commit、should_push；若 should_push=true，还必须携带 summary。"
         )
+        reply_contract = _build_openclaw_reply_contract(title, doc_url, deliver_targets)
+        template_values = {
+            "title": title,
+            "repo_name": repo_name,
+            "repo_slug": repo_slug,
+            "doc_slug": doc_slug,
+            "diff": diff,
+            "yuque_id": yuque_id,
+            "commit": commit,
+            "callback_instruction": callback_instruction,
+            "author": author_name,
+            "doc_url": doc_url,
+            "local_path": local_path_abs or local_path,
+            "reply_contract": reply_contract,
+        }
         if YUQUE2GIT_OPENCLAW_MESSAGE_TEMPLATE:
-            message = YUQUE2GIT_OPENCLAW_MESSAGE_TEMPLATE.format(
-                title=title,
-                repo_name=repo_name,
-                repo_slug=repo_slug,
-                doc_slug=doc_slug,
-                diff=diff,
-                yuque_id=yuque_id,
-                commit=commit,
-                callback_instruction=callback_instruction,
-                author=author_name,
-                doc_url=doc_url,
-                local_path=local_path_abs or local_path,
-            )
+            try:
+                message = _render_openclaw_message_template(YUQUE2GIT_OPENCLAW_MESSAGE_TEMPLATE, template_values)
+            except ValueError as e:
+                logger.warning("%s", e)
+                return
         else:
-            deliver_targets = _parse_deliver_targets()
-            deliver_note = ""
-            if deliver_targets:
-                deliver_note = (
-                    "你的回复会原样投递到订阅者。若决定推送，回复中必须包含更新内容：至少包含文档标题、原文链接、以及根据 diff 提炼的 1～3 句变更要点。禁止只回复「已推送。」——订阅者需要看到具体更新了什么。"
-                    "可先读取上述本地文件再写更新说明。推荐格式示例：【已更新】《文档标题》 原文：<链接> 变更要点：……"
-                )
-            else:
-                deliver_note = "若决定推送，可在回复中写「已推送」。"
             author_line = f"作者：{author_name}\n" if author_name else ""
-            doc_url_line = f"原文地址：{doc_url}\n" if doc_url else ""
+            doc_url_line = f"原文地址：{doc_url or '（未提供原文链接）'}\n"
             local_path_line = ""
             if local_path_abs:
                 local_path_line = f"本地文件（可直接读取以生成概要）：{local_path_abs}\n"
@@ -936,30 +1031,15 @@ async def _openclaw_callback(
                 f"【yuque2git 推送判定】\n\n"
                 f"文档标题：{title}\n知识库：{repo_name}\n仓库：{repo_slug}\n文档：{doc_slug}\n"
                 f"{author_line}{doc_url_line}{local_path_line}\n"
-                f"请根据以下 diff 判断是否推送到远程。{callback_instruction} "
-                f"若决定不推送，请在回复中只写 [不发]。"
-                f"{deliver_note}\n\n---\n\nDiff:\n{diff}"
+                f"请根据以下 diff 判断是否推送到远程。{callback_instruction}\n"
+                f"{reply_contract}\n\n---\n\nDiff:\n{diff}"
             )
-        deliver_targets = _parse_deliver_targets()
-        deliver = bool(deliver_targets)
         headers = {}
         if OPENCLAW_HOOKS_TOKEN:
             headers["Authorization"] = f"Bearer {OPENCLAW_HOOKS_TOKEN}"
         else:
             logger.warning("OPENCLAW_HOOKS_TOKEN not set, Gateway may return 401")
-        # Gateway 通常只按单组 channel/to 投递，多目标时对每个目标各发一次 POST，确保群和私聊都能收到
-        if deliver and deliver_targets:
-            bodies = [
-                {"message": message, "name": "yuque2git", "deliver": True, "channel": t["channel"], "to": t["to"]}
-                for t in deliver_targets
-            ]
-        else:
-            bodies = [
-                {"message": message, "name": "yuque2git", "deliver": deliver and bool(deliver_targets)}
-            ]
-            if deliver_targets:
-                bodies[0]["channel"] = deliver_targets[0]["channel"]
-                bodies[0]["to"] = deliver_targets[0]["to"]
+        bodies = [{"message": message, "name": "yuque2git", "deliver": False}]
     else:
         body = {
             "yuque_id": yuque_id,
@@ -1011,6 +1091,31 @@ async def _openclaw_callback(
         logger.warning("OpenClaw callback POST failed: %s", e)
 
 
+async def _deliver_openclaw_summary(summary: Dict[str, Any]) -> None:
+    """将服务端拼装好的摘要通过 Gateway 投递给配置目标。"""
+    if not _is_openclaw_hooks_agent_url(OPENCLAW_CALLBACK_URL):
+        return
+    deliver_targets = _parse_deliver_targets()
+    if not deliver_targets:
+        return
+    message = _format_openclaw_summary(summary)
+    headers = {}
+    if OPENCLAW_HOOKS_TOKEN:
+        headers["Authorization"] = f"Bearer {OPENCLAW_HOOKS_TOKEN}"
+    bodies = [
+        {"message": message, "name": "yuque2git", "deliver": True, "channel": t["channel"], "to": t["to"]}
+        for t in deliver_targets
+    ]
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            for i, body in enumerate(bodies):
+                if i > 0 and YUQUE2GIT_DELIVER_DELAY_SECONDS > 0 and len(bodies) > 1:
+                    await asyncio.sleep(YUQUE2GIT_DELIVER_DELAY_SECONDS)
+                await client.post(OPENCLAW_CALLBACK_URL, json=body, headers=headers or None)
+    except Exception as e:
+        logger.warning("OpenClaw summary deliver failed: %s", e)
+
+
 # --- FastAPI ---
 app = FastAPI(title="yuque2git Webhook")
 
@@ -1024,7 +1129,7 @@ async def health():
 async def mark_pushed(body: MarkPushedBody):
     if not OUTPUT_DIR or not OUTPUT_DIR.is_dir():
         return Response(status_code=500, content="OUTPUT_DIR not configured or missing")
-    if body.commit:
+    if body.should_push and body.commit:
         r = subprocess.run(
             ["git", "rev-parse", "--verify", body.commit],
             cwd=OUTPUT_DIR,
@@ -1032,10 +1137,16 @@ async def mark_pushed(body: MarkPushedBody):
         )
         if r.returncode != 0:
             return Response(status_code=400, content="commit not found in repo")
-    data = _read_last_push(OUTPUT_DIR)
-    data[str(body.yuque_id)] = body.commit
-    _write_last_push(OUTPUT_DIR, data)
-    return {"ok": True, "yuque_id": body.yuque_id, "commit": body.commit}
+    validated_summary = _validate_openclaw_summary(body.summary) if body.should_push else None
+    if body.should_push and not validated_summary:
+        return Response(status_code=400, content="summary missing or invalid")
+    if body.should_push:
+        data = _read_last_push(OUTPUT_DIR)
+        data[str(body.yuque_id)] = body.commit
+        _write_last_push(OUTPUT_DIR, data)
+        await _deliver_openclaw_summary(validated_summary)
+        return {"ok": True, "yuque_id": body.yuque_id, "commit": body.commit, "delivered": True}
+    return {"ok": True, "yuque_id": body.yuque_id, "commit": body.commit, "delivered": False}
 
 
 @app.post("/webhook")

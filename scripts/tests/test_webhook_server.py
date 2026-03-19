@@ -5,6 +5,7 @@
 或
   cd scripts && python -m pytest tests/test_webhook_server.py -v
 """
+import asyncio
 import json
 import subprocess
 import zlib
@@ -18,16 +19,24 @@ _scripts = Path(__file__).resolve().parent.parent
 if str(_scripts) not in sys.path:
     sys.path.insert(0, str(_scripts))
 
+import webhook_server
 from webhook_server import (
     _slug_safe,
     _parent_path_from_toc,
     _build_md,
     _get_diff,
     _render_lakesheet_markdown,
+    _llm_should_push,
+    _openclaw_callback,
+    _format_openclaw_summary,
+    _render_openclaw_message_template,
+    _validate_openclaw_summary,
     _read_last_push,
     _write_last_push,
     _update_last_push_for,
     _is_openclaw_hooks_agent_url,
+    mark_pushed,
+    MarkPushedBody,
     WebhookPayload,
     WebhookData,
     WebhookBook,
@@ -243,3 +252,235 @@ class TestWebhookPayload:
         )
         assert payload.data.action_type == "delete"
         assert payload.data.id == 456
+
+
+class _FakeResponse:
+    def __init__(self, payload):
+        self._payload = payload
+        self.status_code = 200
+        self.headers = {}
+        self.text = json.dumps(payload, ensure_ascii=False)
+        self.request = None
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._payload
+
+
+class _FakeAsyncClient:
+    def __init__(self, responses=None, sink=None, *args, **kwargs):
+        self.responses = list(responses or [])
+        self.sink = sink
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def post(self, url, headers=None, json=None):
+        if self.sink is not None:
+            self.sink.append({"url": url, "headers": headers or {}, "json": json})
+        if self.responses:
+            return self.responses.pop(0)
+        return _FakeResponse({})
+
+
+class TestLlmDecision:
+    def test_requires_boolean_should_push(self, monkeypatch):
+        monkeypatch.setattr(webhook_server, "OPENAI_API_KEY", "test-key")
+        monkeypatch.setattr(webhook_server, "ENABLE_UPDATE_SUMMARY", True)
+        payload = {"choices": [{"message": {"content": '{"should_push":"false","reason":"noop","update_summary":""}'}}]}
+        monkeypatch.setattr(
+            webhook_server.httpx,
+            "AsyncClient",
+            lambda *args, **kwargs: _FakeAsyncClient(responses=[_FakeResponse(payload)]),
+        )
+
+        should_push, summary = asyncio.run(_llm_should_push("diff", "Doc", "Repo"))
+
+        assert should_push is False
+        assert summary is None
+
+    def test_rejects_empty_summary_when_should_push(self, monkeypatch):
+        monkeypatch.setattr(webhook_server, "OPENAI_API_KEY", "test-key")
+        monkeypatch.setattr(webhook_server, "ENABLE_UPDATE_SUMMARY", True)
+        payload = {"choices": [{"message": {"content": '{"should_push":true,"reason":"important","update_summary":"  "}'}}]}
+        monkeypatch.setattr(
+            webhook_server.httpx,
+            "AsyncClient",
+            lambda *args, **kwargs: _FakeAsyncClient(responses=[_FakeResponse(payload)]),
+        )
+
+        should_push, summary = asyncio.run(_llm_should_push("diff", "Doc", "Repo"))
+
+        assert should_push is False
+        assert summary is None
+
+    def test_accepts_valid_summary(self, monkeypatch):
+        monkeypatch.setattr(webhook_server, "OPENAI_API_KEY", "test-key")
+        monkeypatch.setattr(webhook_server, "ENABLE_UPDATE_SUMMARY", True)
+        payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": '{"should_push":true,"reason":"important","update_summary":"新增了发布流程，并补充了回滚说明。"}'
+                    }
+                }
+            ]
+        }
+        monkeypatch.setattr(
+            webhook_server.httpx,
+            "AsyncClient",
+            lambda *args, **kwargs: _FakeAsyncClient(responses=[_FakeResponse(payload)]),
+        )
+
+        should_push, summary = asyncio.run(_llm_should_push("diff", "Doc", "Repo"))
+
+        assert should_push is True
+        assert summary == "新增了发布流程，并补充了回滚说明。"
+
+
+class TestOpenClawPrompt:
+    def test_default_hooks_message_contains_reply_contract(self, monkeypatch, tmp_path):
+        sent = []
+        monkeypatch.setattr(webhook_server, "OPENCLAW_CALLBACK_URL", "http://gateway.test/hooks/agent")
+        monkeypatch.setattr(webhook_server, "OPENCLAW_HOOKS_TOKEN", "hook-token")
+        monkeypatch.setattr(webhook_server, "YUQUE2GIT_PUBLIC_URL", "http://yuque2git.test")
+        monkeypatch.setattr(webhook_server, "YUQUE2GIT_OPENCLAW_MESSAGE_TEMPLATE", "")
+        monkeypatch.setattr(webhook_server, "YUQUE2GIT_DELIVER_TARGETS_JSON", "")
+        monkeypatch.setattr(webhook_server, "YUQUE2GIT_DELIVER_CHANNEL", "qq")
+        monkeypatch.setattr(webhook_server, "YUQUE2GIT_DELIVER_TO", "12345")
+        monkeypatch.setattr(webhook_server, "OUTPUT_DIR", tmp_path)
+        monkeypatch.setattr(
+            webhook_server.httpx,
+            "AsyncClient",
+            lambda *args, **kwargs: _FakeAsyncClient(sink=sent),
+        )
+
+        asyncio.run(
+            _openclaw_callback(
+                yuque_id=1,
+                repo_slug="repo",
+                doc_slug="doc",
+                title="发布说明",
+                repo_name="知识库",
+                diff="+ 新增回滚步骤",
+                commit="abc123",
+                author_name="Alice",
+                doc_url="https://example.com/doc",
+                local_path="repo/doc.md",
+            )
+        )
+
+        assert len(sent) == 1
+        message = sent[0]["json"]["message"]
+        assert '"should_push": true' in message
+        assert '"repo_name": "<知识库名>"' in message
+        assert '"author": "<作者名>"' in message
+        assert '"doc_url": "https://example.com/doc"' in message
+        assert '"highlights": ["<变更要点1>"' in message
+        assert '"should_push": false' in message
+        assert sent[0]["json"]["deliver"] is False
+
+    def test_custom_template_supports_reply_contract(self):
+        rendered = _render_openclaw_message_template(
+            "标题：{title}\n{reply_contract}",
+            {"title": "文档", "reply_contract": "摘要：\n1. x"},
+        )
+        assert "标题：文档" in rendered
+        assert "摘要：" in rendered
+
+    def test_custom_template_rejects_unknown_field(self):
+        with pytest.raises(ValueError):
+            _render_openclaw_message_template("标题：{title}\n{unknown}", {"title": "文档"})
+
+    def test_validate_and_format_structured_summary(self):
+        summary = _validate_openclaw_summary(
+            {
+                "title": "发布说明",
+                "repo_name": "知识库",
+                "author": "Alice",
+                "doc_url": "https://example.com/doc",
+                "highlights": ["新增发布步骤", "补充回滚说明"],
+            }
+        )
+        assert summary is not None
+        message = _format_openclaw_summary(summary)
+        assert "知识库：知识库" in message
+        assert "作者：Alice" in message
+        assert "1. 新增发布步骤" in message
+        assert "2. 补充回滚说明" in message
+
+    def test_mark_pushed_delivers_formatted_summary(self, monkeypatch, tmp_path):
+        sent = []
+        subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@test"], cwd=tmp_path, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True, capture_output=True)
+        (tmp_path / "a.md").write_text("v1", encoding="utf-8")
+        subprocess.run(["git", "add", "a.md"], cwd=tmp_path, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "first"], cwd=tmp_path, check=True, capture_output=True)
+        commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=tmp_path, capture_output=True, text=True, check=True).stdout.strip()
+
+        monkeypatch.setattr(webhook_server, "OUTPUT_DIR", tmp_path)
+        monkeypatch.setattr(webhook_server, "OPENCLAW_CALLBACK_URL", "http://gateway.test/hooks/agent")
+        monkeypatch.setattr(webhook_server, "OPENCLAW_HOOKS_TOKEN", "hook-token")
+        monkeypatch.setattr(webhook_server, "YUQUE2GIT_DELIVER_TARGETS_JSON", "")
+        monkeypatch.setattr(webhook_server, "YUQUE2GIT_DELIVER_CHANNEL", "qq")
+        monkeypatch.setattr(webhook_server, "YUQUE2GIT_DELIVER_TO", "12345")
+        monkeypatch.setattr(
+            webhook_server.httpx,
+            "AsyncClient",
+            lambda *args, **kwargs: _FakeAsyncClient(sink=sent),
+        )
+
+        result = asyncio.run(
+            mark_pushed(
+                MarkPushedBody(
+                    yuque_id=1,
+                    commit=commit,
+                    should_push=True,
+                    summary={
+                        "title": "发布说明",
+                        "repo_name": "知识库",
+                        "author": "Alice",
+                        "doc_url": "https://example.com/doc",
+                        "highlights": ["新增发布步骤", "补充回滚说明"],
+                    },
+                )
+            )
+        )
+
+        assert result["delivered"] is True
+        assert len(sent) == 1
+        delivered = sent[0]["json"]
+        assert delivered["deliver"] is True
+        assert delivered["channel"] == "qq"
+        assert "知识库：知识库" in delivered["message"]
+        assert "作者：Alice" in delivered["message"]
+
+    def test_mark_pushed_rejects_invalid_summary(self, monkeypatch, tmp_path):
+        subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@test"], cwd=tmp_path, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True, capture_output=True)
+        (tmp_path / "a.md").write_text("v1", encoding="utf-8")
+        subprocess.run(["git", "add", "a.md"], cwd=tmp_path, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "first"], cwd=tmp_path, check=True, capture_output=True)
+        commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=tmp_path, capture_output=True, text=True, check=True).stdout.strip()
+
+        monkeypatch.setattr(webhook_server, "OUTPUT_DIR", tmp_path)
+
+        response = asyncio.run(
+            mark_pushed(
+                MarkPushedBody(
+                    yuque_id=1,
+                    commit=commit,
+                    should_push=True,
+                    summary={"title": "发布说明", "repo_name": "知识库", "highlights": []},
+                )
+            )
+        )
+
+        assert response.status_code == 400

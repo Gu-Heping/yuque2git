@@ -34,10 +34,11 @@
 ## 与 OpenClaw 对接
 
 - **模式**：`PUSH_DECISION_MODE=openclaw`，并设置 `OPENCLAW_CALLBACK_URL`（如 `http(s)://<gateway>:<port>/hooks/agent`）、`OPENCLAW_HOOKS_TOKEN`，可选 `YUQUE2GIT_PUBLIC_URL`。
-- **投递目标**：`YUQUE2GIT_DELIVER_CHANNEL=qq`、`YUQUE2GIT_DELIVER_TO=<ID>`。多目标时 `YUQUE2GIT_DELIVER_TO` 可逗号分隔（如 `1179350197,g:1087044655`），或使用 `YUQUE2GIT_DELIVER_TARGETS` JSON 数组；每个目标会单独 POST，两次 POST 间隔由 `YUQUE2GIT_DELIVER_DELAY_SECONDS` 控制（默认 2 秒），避免 rate limit。
+- **投递目标**：`YUQUE2GIT_DELIVER_CHANNEL=qq`、`YUQUE2GIT_DELIVER_TO=<ID>`。多目标时 `YUQUE2GIT_DELIVER_TO` 可逗号分隔（如 `1179350197,g:1087044655`），或使用 `YUQUE2GIT_DELIVER_TARGETS` JSON 数组；服务端会在收到合法结构化摘要后向每个目标单独 POST，两次 POST 间隔由 `YUQUE2GIT_DELIVER_DELAY_SECONDS` 控制（默认 2 秒），避免 rate limit。
 - **429 重试**：若 Gateway/上游返回 429（API rate limit），服务会自动重试（默认最多 3 次、指数退避），可通过环境变量 `YUQUE2GIT_DELIVER_MAX_RETRIES` 调整；仍失败时会在日志中打出 warning。
-- **发给 Agent 的 prompt**：含文档标题、作者、原文地址、本地文件绝对路径（可读以生成概要）；自定义模板见 `YUQUE2GIT_OPENCLAW_MESSAGE_TEMPLATE`，占位符见 [SKILL.md](SKILL.md)。
-- **OpenClaw 侧**：在 `openclaw.json` 启用 hooks，并确保 Agent 能回调 `/mark-pushed`。
+- **发给 Agent 的 prompt**：含文档标题、知识库、作者、原文地址、本地文件绝对路径（可读以生成概要），并明确要求 Agent 回调结构化 JSON，而不是直接回复最终通知文案；自定义模板见 `YUQUE2GIT_OPENCLAW_MESSAGE_TEMPLATE`，占位符见 [SKILL.md](D:\repos\yuque2git\SKILL.md)。
+- **`/mark-pushed` 回调格式**：至少包含 `yuque_id`、`commit`、`should_push`；当 `should_push=true` 时，必须额外携带 `summary`，其中包含 `title`、`repo_name`、`author`、`doc_url`、`highlights`（1～3 条）。
+- **OpenClaw 侧**：在 `openclaw.json` 启用 hooks，并确保 Agent 能回调 `/mark-pushed`；最终发给订阅者的文案由 yuque2git 服务端统一生成与投递。
 
 ---
 
