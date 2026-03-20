@@ -77,7 +77,10 @@ metadata: '{"openclaw":{"requires":{"bins":["python3"],"env":["YUQUE_TOKEN"]},"h
 | `YUQUE2GIT_DELIVER_TARGETS` | 可选。多目标 JSON 数组，覆盖 CHANNEL+TO。例：`[{"channel":"qq","to":"g:1087044655"},{"channel":"qq","to":"p:1179350197"}]`。群为 `g:群号`，私聊为 `p:QQ号`；直连时与 Napcat 的 group_id/user_id 对应 |
 | `YUQUE2GIT_DIRECT_SEND_URL` | 可选。直连投递时 Napcat OneBot 11 HTTP API 的 base URL（如 `http://127.0.0.1:3000`）。**非空时**摘要由 yuque2git 直连 Napcat 发送，不经 Gateway Agent 轮次，QQ 收到 OpenClaw 生成的摘要原文 |
 | `YUQUE2GIT_DIRECT_SEND_TOKEN` | 可选。与 Napcat HTTP 服务配置的 token 一致时，直连请求头加 `Authorization: Bearer <token>` |
-| `YUQUE2GIT_OPENCLAW_MESSAGE_TEMPLATE` | 自定义发给 Agent 的 message 模板；占位符含 `{title}`、`{repo_name}`、`{repo_slug}`、`{doc_slug}`、`{diff}`、`{yuque_id}`、`{commit}`、`{callback_instruction}`、`{author}`、`{doc_url}`、`{local_path}`（本地路径，相对于 OUTPUT_DIR）；另支持 `{reply_contract}`，即 Agent 须先 POST 的 JSON 契约说明（/mark-pushed） |
+| `YUQUE2GIT_OPENCLAW_MIN_DIFF_CHARS` | 可选。大于 0 时 diff 字符数低于该值则不调用 OpenClaw；`0` 关闭 |
+| `YUQUE2GIT_OPENCLAW_COOLDOWN_SECONDS` | 可选。大于 0 时成功投递摘要后同 `yuque_id` 在冷却期内不再调用 OpenClaw；时间戳在 `OUTPUT_DIR/.yuque-openclaw-push-cooldown.json` |
+| `YUQUE2GIT_OPENCLAW_COOLDOWN_BYPASS_CHARS` | 可选。冷却期内 diff 字符数 ≥ 此值仍调用 OpenClaw；`0` 不绕过 |
+| `YUQUE2GIT_OPENCLAW_MESSAGE_TEMPLATE` | 自定义发给 Agent 的 message 模板；占位符含 `{push_policy}`（与默认首段降噪原则一致）、`{title}`、`{repo_name}`、`{repo_slug}`、`{doc_slug}`、`{diff}`、`{yuque_id}`、`{commit}`、`{callback_instruction}`、`{author}`、`{doc_url}`、`{local_path}`；另须含或可引用 `{reply_contract}`（JSON 契约与推送门槛） |
 | `YUQUE_NAMESPACE` | 可选。语雀命名空间（团队/用户 login），用于生成原文地址；未设时从文档详情的 book.user.login 取 |
 | `WEBHOOK_SECRET` | 可选，校验语雀 Webhook 签名 |
 
@@ -131,6 +134,7 @@ metadata: '{"openclaw":{"requires":{"bins":["python3"],"env":["YUQUE_TOKEN"]},"h
 - **OpenClaw 模式**（`PUSH_DECISION_MODE=openclaw`）：将待判定事件 POST 到 `OPENCLAW_CALLBACK_URL`，由 OpenClaw Agent 判定后回调 `POST /mark-pushed`，body 须含 `yuque_id`、`commit`、`should_push`；当 `should_push=true` 时还须带 `summary`，含 `title`、`repo_name`、`author`、`doc_url`、`highlights`（1～3 条）。
   - **接入 OpenClaw Gateway Hooks**（推荐）：将 `OPENCLAW_CALLBACK_URL` 设为 `http(s)://<gateway>:<port>/hooks/agent`，并配置 `OPENCLAW_HOOKS_TOKEN`（与 openclaw 的 `hooks.token` 一致）、可选 `YUQUE2GIT_PUBLIC_URL`。若希望投递到 QQ，设置 `YUQUE2GIT_DELIVER_CHANNEL=qq` 与 `YUQUE2GIT_DELIVER_TO=<群ID或用户ID>`（群为 `g:群号`，私聊为 `p:QQ号`）。Agent 须先向 `/mark-pushed` 回调结构化 JSON，由 yuque2git 统一生成并投递最终文案；自定义 prompt 可用 `YUQUE2GIT_OPENCLAW_MESSAGE_TEMPLATE`，占位符见上表，其中 `{reply_contract}` 为 Agent 须遵守的 JSON 契约说明。OpenClaw 侧在 `~/.openclaw/openclaw.json` 的 `hooks` 下启用 Hooks（`hooks.enabled: true`、`hooks.token: "<共享密钥>"`），并确保 main（或目标）Agent 能访问 yuque2git（如通过 `exec` 执行 `curl` 调用 `YUQUE2GIT_PUBLIC_URL/mark-pushed`），网络允许 Gateway 访问 yuque2git 服务。
   - **直连发 QQ（B 方案）**：设置 `YUQUE2GIT_DIRECT_SEND_URL`（如 `http://127.0.0.1:3000`）后，摘要由 yuque2git 直连 Napcat 的 OneBot 11 API 发送，不经 Gateway 的 Agent 投递轮次，QQ 收到的是 OpenClaw 回调中的摘要原文；可选 `YUQUE2GIT_DIRECT_SEND_TOKEN` 与 Napcat HTTP token 一致。yuque2git 需能访问 Napcat 端口（本机或宿主机映射）。
+  - **推送频率**：默认提示词要求琐碎修改 `should_push=false`，重要/阶段性更新再推。仍偏频时可加 `YUQUE2GIT_OPENCLAW_MIN_DIFF_CHARS`、`YUQUE2GIT_OPENCLAW_COOLDOWN_SECONDS`（及可选 `YUQUE2GIT_OPENCLAW_COOLDOWN_BYPASS_CHARS`），详见上表与 [docs/openclaw-summary-prompt.md](docs/openclaw-summary-prompt.md)。
 
 ## 回调失败自救（Runbook）
 

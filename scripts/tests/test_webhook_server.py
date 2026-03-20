@@ -35,6 +35,8 @@ from webhook_server import (
     _write_last_push,
     _update_last_push_for,
     _is_openclaw_hooks_agent_url,
+    _openclaw_precall_skip_reason,
+    _record_openclaw_push_cooldown_now,
     mark_pushed,
     MarkPushedBody,
     WebhookPayload,
@@ -383,6 +385,7 @@ class TestOpenClawPrompt:
         assert '"doc_url": "https://example.com/doc"' in message
         assert '"highlights": ["<变更要点1>"' in message
         assert '"should_push": false' in message
+        assert "推送门槛" in message or "默认保守" in message
         assert sent[0]["json"]["deliver"] is False
 
     def test_custom_template_supports_reply_contract(self):
@@ -410,7 +413,7 @@ class TestOpenClawPrompt:
         assert summary is not None
         message = _format_openclaw_summary(summary)
         assert "知识库：知识库" in message
-        assert "作者：Alice" in message
+        assert "Alice 更新了《发布说明》" in message
         assert "1. 新增发布步骤" in message
         assert "2. 补充回滚说明" in message
 
@@ -459,7 +462,7 @@ class TestOpenClawPrompt:
         assert delivered["deliver"] is True
         assert delivered["channel"] == "qq"
         assert "知识库：知识库" in delivered["message"]
-        assert "作者：Alice" in delivered["message"]
+        assert "Alice 更新了《发布说明》" in delivered["message"]
 
     def test_mark_pushed_rejects_invalid_summary(self, monkeypatch, tmp_path):
         subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
@@ -484,3 +487,23 @@ class TestOpenClawPrompt:
         )
 
         assert response.status_code == 400
+
+
+class TestOpenClawPrecallGate:
+    def test_min_diff_chars_skip(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(webhook_server, "YUQUE2GIT_OPENCLAW_MIN_DIFF_CHARS", 100)
+        monkeypatch.setattr(webhook_server, "YUQUE2GIT_OPENCLAW_COOLDOWN_SECONDS", 0)
+        r = _openclaw_precall_skip_reason(tmp_path, 1, "short")
+        assert r is not None
+        assert "min_diff" in r
+
+    def test_cooldown_skip_and_bypass(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(webhook_server, "YUQUE2GIT_OPENCLAW_MIN_DIFF_CHARS", 0)
+        monkeypatch.setattr(webhook_server, "YUQUE2GIT_OPENCLAW_COOLDOWN_SECONDS", 3600)
+        monkeypatch.setattr(webhook_server, "YUQUE2GIT_OPENCLAW_COOLDOWN_BYPASS_CHARS", 500)
+        _record_openclaw_push_cooldown_now(tmp_path, 42)
+        r = _openclaw_precall_skip_reason(tmp_path, 42, "x" * 100)
+        assert r is not None
+        assert "cooldown" in r
+        r2 = _openclaw_precall_skip_reason(tmp_path, 42, "y" * 500)
+        assert r2 is None

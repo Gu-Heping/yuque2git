@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import smtplib
+import time
 import subprocess
 import zlib
 from datetime import datetime, timezone
@@ -30,6 +31,21 @@ from pydantic import BaseModel
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# OpenClaw 默认 message 首段原则；自定义模板可用占位符 {push_policy}
+OPENCLAW_PUSH_POLICY_SHORT = (
+    "【重要】以降低通知频率、提高推送质量为目标：仅在阶段性/实质性内容更新，或 diff 体现重要信息时建议推送；"
+    "琐碎修改请回调 should_push=false。"
+)
+# 写入 reply_contract 的详细门槛（与 Agent 契约一体）
+OPENCLAW_PUSH_GATE_RULES = (
+    "【推送门槛（请严格遵守）】\n"
+    "- 默认保守：无把握时一律 should_push=false，避免打扰订阅者。\n"
+    "- 应 should_push=false：错别字或标点微调、纯排版或仅空格换行、单句措辞润色、无关紧要的链接或元数据微调、"
+    "极小片段修改且无信息增量。\n"
+    "- 可 should_push=true：新增或重写整节、多段逻辑或结构变化、重要结论/决策/数据/API 或接口约定变更、"
+    "明显「阶段性成果」的篇幅与语义变化；若 diff 极少但信息极重要也可为 true，且 highlights 须写明原因。\n\n"
+)
 
 # 文件日志路径（在 main() 中挂载）
 _WEBHOOK_LOG_FILE: Optional[Path] = None
@@ -54,12 +70,19 @@ YUQUE2GIT_DELIVER_MAX_RETRIES = max(0, int(os.environ.get("YUQUE2GIT_DELIVER_MAX
 YUQUE2GIT_DIRECT_SEND_URL = os.environ.get("YUQUE2GIT_DIRECT_SEND_URL", "").strip().rstrip("/")
 YUQUE2GIT_DIRECT_SEND_TOKEN = os.environ.get("YUQUE2GIT_DIRECT_SEND_TOKEN", "").strip()
 YUQUE2GIT_OPENCLAW_MESSAGE_TEMPLATE = os.environ.get("YUQUE2GIT_OPENCLAW_MESSAGE_TEMPLATE", "").strip()
+# OpenClaw 降噪：diff 字符数低于此值则不调用 OpenClaw（0=关闭）
+YUQUE2GIT_OPENCLAW_MIN_DIFF_CHARS = max(0, int(os.environ.get("YUQUE2GIT_OPENCLAW_MIN_DIFF_CHARS", "0")))
+# 成功投递摘要后，同一 yuque_id 在此秒数内不再调用 OpenClaw（0=关闭）；大 diff 可绕过见下一项
+YUQUE2GIT_OPENCLAW_COOLDOWN_SECONDS = max(0, int(os.environ.get("YUQUE2GIT_OPENCLAW_COOLDOWN_SECONDS", "0")))
+# 冷却期内若 diff 字符数 ≥ 此值仍调用 OpenClaw（0=不启用绕过）
+YUQUE2GIT_OPENCLAW_COOLDOWN_BYPASS_CHARS = max(0, int(os.environ.get("YUQUE2GIT_OPENCLAW_COOLDOWN_BYPASS_CHARS", "0")))
 # 语雀文档原文地址：用于生成 doc_url，未设时从 detail.book.user.login 取
 YUQUE_NAMESPACE = os.environ.get("YUQUE_NAMESPACE", "").strip()
 # 元数据时间转为本地可读：YUQUE_TIMEZONE（如 Asia/Shanghai），未设默认 Asia/Shanghai
 YUQUE_TIMEZONE = os.environ.get("YUQUE_TIMEZONE", "Asia/Shanghai").strip() or "Asia/Shanghai"
 NOTIFY_URL = os.environ.get("NOTIFY_URL", "").strip()
 LAST_PUSH_FILE = ".yuque-last-push.json"  # key: yuque_id (str), value: commit hash
+OPENCLAW_COOLDOWN_FILE = ".yuque-openclaw-push-cooldown.json"  # key: yuque_id (str), value: unix ts 上次成功投递摘要
 IDX_FILE = ".yuque-id-to-path.json"  # key: yuque_id (str), value: rel_path，用于文档移动时 diff 查旧路径
 MEMBERS_FILE = ".yuque-members.json"  # key: user_id (str), value: {"name": "...", "login": "..."}，本地缓存避免重复请求
 PENDING_PUSH_FILE = os.environ.get("PENDING_PUSH_FILE", ".yuque-pending-pushes.jsonl").strip() or ".yuque-pending-pushes.jsonl"
@@ -1163,7 +1186,7 @@ def _build_openclaw_reply_contract(title: str, doc_url: str, deliver_targets: Li
     link_placeholder = doc_url or "（未提供原文链接，需按此原样保留）"
     push_note = "若决定推送，必须先向 /mark-pushed 回调结构化 JSON；不要把摘要直接发给订阅者。"
     target_note = "服务端会在收到合法 JSON 后统一投递给订阅者。" if deliver_targets else "服务端会在收到合法 JSON 后统一生成摘要。"
-    return (
+    return OPENCLAW_PUSH_GATE_RULES + (
         "若决定不推送，请回调 JSON："
         '{"yuque_id": <yuque_id>, "commit": "<commit>", "should_push": false}。\n'
         f"{push_note}{target_note}\n"
@@ -1181,7 +1204,8 @@ def _build_openclaw_reply_contract(title: str, doc_url: str, deliver_targets: Li
         "要求：\n"
         "- title、repo_name、author、doc_url 必须非空。\n"
         "- highlights 必须是 1～3 条字符串，每条都要写清楚具体改了什么；建议 2～3 条要点，避免仅一条笼统概括导致推送内容过简。\n"
-        "- 禁止返回额外说明、Markdown 代码块或自然语言正文。"
+        "- 禁止返回额外说明、Markdown 代码块或自然语言正文。\n"
+        "- 再次强调：琐碎修改必须 should_push=false；仅当变更值得让订阅者专门打开文档时再 should_push=true。"
     )
 
 
@@ -1245,6 +1269,49 @@ def _update_last_push_for(output_dir: Path, yuque_id: int, commit: str) -> None:
     data = _read_last_push(output_dir)
     data[str(yuque_id)] = commit
     _write_last_push(output_dir, data)
+
+
+def _read_openclaw_cooldown(output_dir: Path) -> Dict[str, float]:
+    p = output_dir / OPENCLAW_COOLDOWN_FILE
+    if not p.exists():
+        return {}
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+        return {str(k): float(v) for k, v in raw.items() if v is not None}
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return {}
+
+
+def _write_openclaw_cooldown(output_dir: Path, data: Dict[str, float]) -> None:
+    p = output_dir / OPENCLAW_COOLDOWN_FILE
+    p.write_text(json.dumps(data, ensure_ascii=False, indent=0, sort_keys=True), encoding="utf-8")
+
+
+def _record_openclaw_push_cooldown_now(output_dir: Path, yuque_id: int) -> None:
+    d = _read_openclaw_cooldown(output_dir)
+    d[str(yuque_id)] = time.time()
+    _write_openclaw_cooldown(output_dir, d)
+
+
+def _openclaw_precall_skip_reason(output_dir: Path, yuque_id: int, diff_text: str) -> Optional[str]:
+    """若应跳过对 OpenClaw 的调用则返回原因，否则返回 None。"""
+    d = diff_text or ""
+    if YUQUE2GIT_OPENCLAW_MIN_DIFF_CHARS > 0 and len(d) < YUQUE2GIT_OPENCLAW_MIN_DIFF_CHARS:
+        return f"openclaw_skip_min_diff_chars(len={len(d)},min={YUQUE2GIT_OPENCLAW_MIN_DIFF_CHARS})"
+    if YUQUE2GIT_OPENCLAW_COOLDOWN_SECONDS > 0:
+        cool = _read_openclaw_cooldown(output_dir)
+        last_ts = float(cool.get(str(yuque_id), 0) or 0)
+        if last_ts > 0:
+            elapsed = time.time() - last_ts
+            if elapsed < YUQUE2GIT_OPENCLAW_COOLDOWN_SECONDS:
+                bypass = YUQUE2GIT_OPENCLAW_COOLDOWN_BYPASS_CHARS
+                if bypass > 0 and len(d) >= bypass:
+                    return None
+                return (
+                    f"openclaw_skip_cooldown(elapsed_s={elapsed:.0f},"
+                    f"need_s={YUQUE2GIT_OPENCLAW_COOLDOWN_SECONDS})"
+                )
+    return None
 
 
 async def _notify_push(
@@ -1451,6 +1518,7 @@ async def _openclaw_callback(
             "doc_url": doc_url,
             "local_path": local_path_abs or local_path,
             "reply_contract": reply_contract,
+            "push_policy": OPENCLAW_PUSH_POLICY_SHORT,
         }
         if YUQUE2GIT_OPENCLAW_MESSAGE_TEMPLATE:
             try:
@@ -1466,6 +1534,7 @@ async def _openclaw_callback(
                 local_path_line = f"本地文件（可直接读取以生成概要）：{local_path_abs}\n"
             message = (
                 f"【yuque2git 推送判定】\n\n"
+                f"{OPENCLAW_PUSH_POLICY_SHORT}\n\n"
                 f"文档标题：{title}\n知识库：{repo_name}\n仓库：{repo_slug}\n文档：{doc_slug}\n"
                 f"{author_line}{doc_url_line}{local_path_line}\n"
                 f"请根据以下 diff 判断是否推送到远程。{callback_instruction}\n"
@@ -1791,6 +1860,8 @@ async def mark_pushed(body: MarkPushedBody):
         data[str(resolved_yuque_id)] = body.commit
         _write_last_push(OUTPUT_DIR, data)
         delivered = await _deliver_openclaw_summary(validated_summary)
+        if delivered and YUQUE2GIT_OPENCLAW_COOLDOWN_SECONDS > 0 and OUTPUT_DIR:
+            _record_openclaw_push_cooldown_now(OUTPUT_DIR, resolved_yuque_id)
         return {"ok": True, "yuque_id": resolved_yuque_id, "commit": body.commit, "delivered": delivered}
     return {"ok": True, "yuque_id": resolved_yuque_id, "commit": body.commit, "delivered": False}
 
@@ -1897,6 +1968,10 @@ async def webhook(request: Request):
             return Response(status_code=200, content="ok")
 
         if PUSH_DECISION_MODE == "openclaw":
+            skip_reason = _openclaw_precall_skip_reason(OUTPUT_DIR, data.id, diff_text)
+            if skip_reason:
+                logger.info("OpenClaw skipped (%s) yuque_id=%s", skip_reason, data.id)
+                return Response(status_code=200, content="ok")
             namespace = (
                 (detail.get("book") or {}).get("user") or {}
             ).get("login") or YUQUE_NAMESPACE
