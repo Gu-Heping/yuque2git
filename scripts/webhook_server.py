@@ -60,15 +60,29 @@ OPENCLAW_HOOKS_TOKEN = os.environ.get("OPENCLAW_HOOKS_TOKEN", "").strip()
 YUQUE2GIT_PUBLIC_URL = os.environ.get("YUQUE2GIT_PUBLIC_URL", "").strip()
 YUQUE2GIT_DELIVER_CHANNEL = os.environ.get("YUQUE2GIT_DELIVER_CHANNEL", "").strip()
 YUQUE2GIT_DELIVER_TO = os.environ.get("YUQUE2GIT_DELIVER_TO", "").strip()
-# 多目标：JSON 数组 [{"channel":"qq","to":"id1"},...]；未设时由 CHANNEL+TO 解析（TO 可逗号分隔多个）
+# 多目标：JSON 数组 [{"channel":"qq","to":"g:群号"}, {"channel":"discord","to":"channel:频道ID"}, ...]；
+# 未设时由 CHANNEL+TO 解析（TO 可逗号分隔多个同 channel 目标）
 YUQUE2GIT_DELIVER_TARGETS_JSON = os.environ.get("YUQUE2GIT_DELIVER_TARGETS", "").strip()
 # 多目标时两次 POST 之间的间隔（秒），避免连续请求触发 Gateway/上游 rate limit，默认 2
 YUQUE2GIT_DELIVER_DELAY_SECONDS = max(0.0, float(os.environ.get("YUQUE2GIT_DELIVER_DELAY_SECONDS", "2.0")))
 # OpenClaw/Gateway 返回 429 时的最大重试次数（每次指数退避），默认 3
 YUQUE2GIT_DELIVER_MAX_RETRIES = max(0, int(os.environ.get("YUQUE2GIT_DELIVER_MAX_RETRIES", "3")))
-# 直连 Napcat 发 QQ：非空时摘要投递走 Napcat send_group_msg/send_private_msg，不再 POST 到 Gateway
+# 直连投递（不经 OpenClaw Agent 轮次发最终摘要文案）：
+# - Napcat OneBot：配置 YUQUE2GIT_DIRECT_SEND_URL（+ 可选 TOKEN），仅处理 deliver channel=qq
+# - Discord Bot REST：配置 YUQUE2GIT_DISCORD_BOT_TOKEN（或回退 DISCORD_BOT_TOKEN），仅处理 channel=discord
+# 二者可同时配置：按目标 channel 分别走对应后端；无法直连的目标回退到 OpenClaw /hooks/agent（若已配置）
 YUQUE2GIT_DIRECT_SEND_URL = os.environ.get("YUQUE2GIT_DIRECT_SEND_URL", "").strip().rstrip("/")
 YUQUE2GIT_DIRECT_SEND_TOKEN = os.environ.get("YUQUE2GIT_DIRECT_SEND_TOKEN", "").strip()
+YUQUE2GIT_DISCORD_BOT_TOKEN = (
+    os.environ.get("YUQUE2GIT_DISCORD_BOT_TOKEN", "").strip()
+    or os.environ.get("DISCORD_BOT_TOKEN", "").strip()
+)
+YUQUE2GIT_DISCORD_API_BASE = (
+    os.environ.get("YUQUE2GIT_DISCORD_API_BASE", "https://discord.com/api/v10").strip().rstrip("/")
+    or "https://discord.com/api/v10"
+)
+# 仅 Discord Bot REST 使用（httpx proxy）；勿用全局 HTTP(S)_PROXY 代替，以免语雀 API、OpenClaw 本地回调等出站误走代理
+YUQUE2GIT_DISCORD_HTTP_PROXY = os.environ.get("YUQUE2GIT_DISCORD_HTTP_PROXY", "").strip()
 YUQUE2GIT_OPENCLAW_MESSAGE_TEMPLATE = os.environ.get("YUQUE2GIT_OPENCLAW_MESSAGE_TEMPLATE", "").strip()
 # OpenClaw 降噪：diff 字符数低于此值则不调用 OpenClaw（0=关闭）
 YUQUE2GIT_OPENCLAW_MIN_DIFF_CHARS = max(0, int(os.environ.get("YUQUE2GIT_OPENCLAW_MIN_DIFF_CHARS", "0")))
@@ -277,9 +291,32 @@ def _parent_path_from_toc(toc_list: List[Dict], doc_id: int, doc_slug: Optional[
 # 仅写入 Obsidian 友好 + 同步必需的少量属性，避免冗余（type/body_*/book 嵌套/统计/多时间戳等）
 
 
-def _author_name_from_detail(detail: Dict[str, Any]) -> str:
-    """从文档详情 API 返回的 last_editor / creator / user 中取显示名（webhook 常不带 actor）。"""
-    for key in ("last_editor", "creator", "user"):
+def _creator_user_id(detail: Dict[str, Any]) -> Optional[int]:
+    """文档创建者用户 id：creator.id → user_id → user.id（不使用 last_editor）。"""
+    c = detail.get("creator")
+    if isinstance(c, dict) and c.get("id") is not None:
+        try:
+            return int(c["id"])
+        except (TypeError, ValueError):
+            pass
+    uid = detail.get("user_id")
+    if uid is not None:
+        try:
+            return int(uid)
+        except (TypeError, ValueError):
+            pass
+    u = detail.get("user")
+    if isinstance(u, dict) and u.get("id") is not None:
+        try:
+            return int(u["id"])
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def _creator_name_from_detail(detail: Dict[str, Any]) -> str:
+    """从文档详情中取创建者显示名：仅 creator / user 嵌套对象（不用 last_editor）。"""
+    for key in ("creator", "user"):
         obj = detail.get(key)
         if isinstance(obj, dict):
             name = (obj.get("name") or obj.get("login") or "").strip()
@@ -292,33 +329,30 @@ async def _resolve_author_name(
     client: "YuqueClient",
     output_dir: Path,
     detail: Dict[str, Any],
-    actor_name: str = "",
 ) -> str:
-    """解析作者显示名：优先 actor，再 .yuque-members.json（团队内姓名），再 detail 内嵌，缺失时 GET /users/:id。"""
-    if (actor_name or "").strip():
-        return (actor_name or "").strip()
-    user_id = detail.get("last_editor_id") or detail.get("user_id")
-    user_id_str = str(user_id) if user_id else ""
+    """解析文档创建者显示名：.yuque-members.json → 详情嵌套 creator/user → GET /users/:id（创建者 id）。"""
+    creator_id = _creator_user_id(detail)
+    creator_id_str = str(creator_id) if creator_id is not None else ""
     members = _read_members(output_dir)
-    if user_id_str and user_id_str in members:
-        return (members[user_id_str].get("name") or members[user_id_str].get("login") or "").strip()
-    name = _author_name_from_detail(detail)
+    if creator_id_str and creator_id_str in members:
+        return (members[creator_id_str].get("name") or members[creator_id_str].get("login") or "").strip()
+    name = _creator_name_from_detail(detail)
     if name:
         return name
-    if not user_id:
+    if creator_id is None:
         return ""
     try:
-        user_data = await client.get_user_by_id(user_id)
+        user_data = await client.get_user_by_id(creator_id)
         if user_data:
             entry = {
                 "name": (user_data.get("name") or "").strip(),
                 "login": (user_data.get("login") or "").strip(),
             }
-            members[user_id_str] = entry
+            members[creator_id_str] = entry
             _write_members(output_dir, members)
             return (entry["name"] or entry["login"] or "").strip()
     except Exception as e:
-        logger.warning("get_user_by_id %s failed: %s", user_id, e)
+        logger.warning("get_user_by_id %s failed: %s", creator_id, e)
     return ""
 
 
@@ -342,7 +376,7 @@ def _normalize_ts_local(ts: Optional[str]) -> str:
         return t
 
 
-def _build_md(detail: Dict[str, Any], author_name: str = "") -> str:
+def _build_md(detail: Dict[str, Any], author_name: str = "", members: Optional[Dict] = None) -> str:
     """frontmatter（仅允许字段）+ 元数据表格 + 正文。"""
     created = _normalize_ts_local(detail.get("created_at") or "")
     updated = _normalize_ts_local(detail.get("updated_at") or detail.get("content_updated_at") or "")
@@ -370,15 +404,21 @@ def _build_md(detail: Dict[str, Any], author_name: str = "") -> str:
     md = "---\n" + yaml_block + "\n---\n\n"
     md += "| 作者 | 创建时间 | 更新时间 |\n|------|----------|----------|\n"
     md += f"| {author_display} | {table_cell(str(created))} | {table_cell(str(updated))} |\n\n"
-    md += _render_doc_body(detail)
+    md += _render_doc_body(detail, members)
     if not md.endswith("\n"):
         md += "\n"
     return md
 
 
-def _render_doc_body(detail: Dict[str, Any]) -> str:
-    if (detail.get("format") or "").lower() == "lakesheet" or (detail.get("type") or "").lower() == "sheet":
+def _render_doc_body(detail: Dict[str, Any], members: Optional[Dict] = None) -> str:
+    fmt = (detail.get("format") or "").lower()
+    typ = (detail.get("type") or "").lower()
+    if fmt == "lakesheet" or typ == "sheet":
         rendered = _render_lakesheet_markdown(detail.get("body") or "")
+        if rendered:
+            return rendered
+    if fmt == "laketable" or typ == "table":
+        rendered = _render_laketable_markdown(detail, members)
         if rendered:
             return rendered
     return (detail.get("body") or "").strip()
@@ -415,6 +455,138 @@ def _render_lakesheet_markdown(raw_body: Any) -> str:
         blocks.append("```")
         blocks.append("")
     return "\n".join(blocks).strip()
+
+
+def _render_laketable_markdown(detail: Dict[str, Any], members: Optional[Dict] = None) -> str:
+    """将 laketable 多维表格转换为可读 TSV 格式
+
+    语雀 laketable 数据分布在两个字段：
+    - body: 表格元数据（列定义、视图、行 ID 列表）
+    - body_table: 实际数据（records 数组，每条记录的 values 按列顺序存储）
+    """
+    body = detail.get("body") or ""
+    body_table = detail.get("body_table") or ""
+
+    try:
+        body_data = json.loads(body) if isinstance(body, str) else body
+        table_data = json.loads(body_table) if isinstance(body_table, str) else body_table
+    except (TypeError, json.JSONDecodeError):
+        return str(body or "").strip()
+
+    sheet = body_data.get("sheet", [{}])[0] if body_data.get("sheet") else {}
+    columns = sheet.get("columns", [])
+    records = table_data.get("records", []) if isinstance(table_data, dict) else []
+
+    if not columns:
+        # 没有列定义，返回原始 JSON
+        return json.dumps(body_data, ensure_ascii=False, indent=2)
+
+    blocks: List[str] = [
+        "> Auto-generated from Yuque laketable for readable review and diff.",
+        "",
+    ]
+
+    sheet_name = sheet.get("name") or detail.get("title") or "Table"
+    blocks.append(f"## {sheet_name}")
+    blocks.append("")
+    blocks.append("```tsv")
+
+    # 表头
+    col_names = [c.get("name", c.get("id", "")) for c in columns]
+    blocks.append("\t".join(col_names))
+
+    # 数据行
+    if not records:
+        blocks.append("(empty)")
+    else:
+        for rec in records:
+            values = rec.get("values", [])
+            cells = []
+            for i, col in enumerate(columns):
+                cell_value = _laketable_value_to_text(values[i] if i < len(values) else None, col, members)
+                cells.append(cell_value)
+            blocks.append("\t".join(cells))
+
+    blocks.append("```")
+    blocks.append("")
+
+    return "\n".join(blocks).strip()
+
+
+def _laketable_value_to_text(cell: Any, col_def: Dict, members: Optional[Dict] = None) -> str:
+    """将 laketable 单元格值转换为文本"""
+    if cell is None:
+        return ""
+
+    # 处理 {"value": ...} 包装
+    if isinstance(cell, dict) and "value" in cell:
+        value = cell["value"]
+    else:
+        value = cell
+
+    if value is None:
+        return ""
+
+    col_type = col_def.get("type", "")
+
+    if col_type == "mention":
+        # 提及用户：优先从团队成员缓存获取姓名，多个用逗号分隔
+        if isinstance(value, list):
+            names = []
+            for u in value:
+                if isinstance(u, dict):
+                    uid = u.get("id")
+                    uid_str = str(uid) if uid else ""
+                    # 优先使用团队内姓名
+                    if members and uid_str in members:
+                        names.append(members[uid_str].get("name") or members[uid_str].get("login") or u.get("name") or u.get("login", ""))
+                    else:
+                        names.append(u.get("name", u.get("login", "")))
+            return ", ".join(names)
+        return str(value)
+
+    if col_type == "select":
+        # 单选：查找选项值
+        options = col_def.get("options", [])
+        for opt in options:
+            if opt.get("id") == value:
+                return opt.get("value", value)
+        return str(value) if value else ""
+
+    if col_type == "date":
+        # 日期：使用 text 字段
+        if isinstance(value, dict):
+            return value.get("text", value.get("time", ""))
+        return str(value)
+
+    if col_type == "link":
+        # 链接：显示 URL 或文本
+        if isinstance(value, dict):
+            return value.get("link", value.get("text", ""))
+        return str(value)
+
+    if col_type == "multiSelect":
+        # 多选：逗号分隔
+        if isinstance(value, list):
+            opt_ids = value
+            options = col_def.get("options", [])
+            names = []
+            for opt in options:
+                if opt.get("id") in opt_ids:
+                    names.append(opt.get("value", opt.get("id")))
+            return ", ".join(names)
+        return str(value)
+
+    # 默认：直接转字符串
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, dict):
+        return value.get("text", value.get("name", json.dumps(value, ensure_ascii=False)))
+    if isinstance(value, list):
+        return ", ".join(str(v) for v in value)
+    return str(value)
 
 
 def _sheet_to_tsv_lines(sheet: Dict[str, Any]) -> List[str]:
@@ -873,7 +1045,7 @@ async def _replay_pending_async(output_dir: Path, limit: int) -> Tuple[int, int,
             continue
 
         if t in ("openclaw_callback_delivery_failed", "openclaw_summary_delivery_failed", "openclaw_summary_delivery_exception"):
-            if t in ("openclaw_summary_delivery_failed", "openclaw_summary_delivery_exception") and YUQUE2GIT_DIRECT_SEND_URL:
+            if t in ("openclaw_summary_delivery_failed", "openclaw_summary_delivery_exception") and _direct_send_any_backend_configured():
                 summary = evt.get("summary")
                 if summary and isinstance(summary, dict):
                     if await _deliver_openclaw_summary(summary):
@@ -1407,7 +1579,13 @@ async def _send_email_push(
 
 
 def _parse_deliver_targets() -> List[Dict[str, str]]:
-    """解析推送目标列表。支持 YUQUE2GIT_DELIVER_TARGETS JSON 数组，或 CHANNEL+TO（TO 可逗号分隔）。"""
+    """解析推送目标列表。支持 YUQUE2GIT_DELIVER_TARGETS JSON 数组，或 CHANNEL+TO（TO 可逗号分隔）。
+
+    OpenClaw Hooks 投递约定（与 Gateway /hooks/agent 一致）：
+    - qq：to 为 g:<群号> 或 p:<QQ号>（与 Napcat OneBot 一致）。
+    - discord：to 为 channel:<Discord 频道 snowflake> 或 user:<用户 snowflake>（与 openclaw docs 一致）。
+    其它 channel 名由 OpenClaw 支持的插件决定。HTTP 直连：qq→Napcat（YUQUE2GIT_DIRECT_SEND_URL），discord→Bot REST（YUQUE2GIT_DISCORD_BOT_TOKEN）；未覆盖的目标走 OpenClaw /hooks/agent。
+    """
     if YUQUE2GIT_DELIVER_TARGETS_JSON:
         try:
             raw = json.loads(YUQUE2GIT_DELIVER_TARGETS_JSON)
@@ -1430,6 +1608,158 @@ def _is_openclaw_hooks_agent_url(url: str) -> bool:
     """是否指向 OpenClaw Gateway 的 /hooks/agent 入口。"""
     u = (url or "").rstrip("/")
     return u.endswith("/hooks/agent")
+
+
+def _direct_send_napcat_available() -> bool:
+    return bool(YUQUE2GIT_DIRECT_SEND_URL)
+
+
+def _direct_send_discord_available() -> bool:
+    return bool(YUQUE2GIT_DISCORD_BOT_TOKEN)
+
+
+def _direct_send_any_backend_configured() -> bool:
+    return _direct_send_napcat_available() or _direct_send_discord_available()
+
+
+def _valid_qq_deliver_to(to: str) -> bool:
+    t = (to or "").strip()
+    return bool(t.startswith(("g:", "p:")) and t[2:].strip().isdigit())
+
+
+def _valid_discord_deliver_to(to: str) -> bool:
+    t = (to or "").strip()
+    if t.startswith("channel:") and t[8:].strip().isdigit():
+        return True
+    if t.startswith("user:") and t[5:].strip().isdigit():
+        return True
+    return False
+
+
+def _partition_deliver_targets(
+    targets: List[Dict[str, str]],
+) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
+    """拆成可走 HTTP 直连的目标 vs 需走 OpenClaw Hooks 投递的目标。"""
+    direct: List[Dict[str, str]] = []
+    gateway: List[Dict[str, str]] = []
+    for t in targets:
+        ch = (t.get("channel") or "").strip()
+        to = (t.get("to") or "").strip()
+        if ch == "qq" and _direct_send_napcat_available() and _valid_qq_deliver_to(to):
+            direct.append(t)
+        elif ch == "discord" and _direct_send_discord_available() and _valid_discord_deliver_to(to):
+            direct.append(t)
+        else:
+            gateway.append(t)
+    return direct, gateway
+
+
+def _split_discord_message_content(text: str, max_chars: int = 2000) -> List[str]:
+    """Discord message content 上限 2000 字符，超长拆多条。"""
+    if not text:
+        return []
+    return [text[i : i + max_chars] for i in range(0, len(text), max_chars)]
+
+
+async def _discord_api_post_with_retry(
+    client: httpx.AsyncClient,
+    method: str,
+    url: str,
+    *,
+    headers: Dict[str, str],
+    json_body: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """POST/PATCH Discord REST；处理 429 retry_after。"""
+    for attempt in range(YUQUE2GIT_DELIVER_MAX_RETRIES + 1):
+        try:
+            r = await client.request(method, url, headers=headers, json=json_body)
+        except (httpx.TimeoutException, httpx.RequestError):
+            if attempt < YUQUE2GIT_DELIVER_MAX_RETRIES:
+                await asyncio.sleep(2**attempt)
+                continue
+            return False
+        if r.status_code == 429 and attempt < YUQUE2GIT_DELIVER_MAX_RETRIES:
+            wait = 1.0
+            try:
+                data = r.json() if r.content else {}
+                if isinstance(data.get("retry_after"), (int, float)):
+                    wait = float(data["retry_after"])
+            except Exception:
+                wait = 2**attempt
+            await asyncio.sleep(min(wait, 60.0))
+            continue
+        if 200 <= r.status_code < 300:
+            return True
+        if r.status_code >= 500 and attempt < YUQUE2GIT_DELIVER_MAX_RETRIES:
+            await asyncio.sleep(2**attempt)
+            continue
+        logger.warning("Discord API %s %s -> %s: %s", method, url, r.status_code, (r.text or "")[:300])
+        return False
+    return False
+
+
+async def _send_discord_direct_message(client: httpx.AsyncClient, to: str, message: str) -> bool:
+    """Discord Bot REST：to 为 channel:<id> 或 user:<id>（后者先开 DM 再发）。"""
+    if not YUQUE2GIT_DISCORD_BOT_TOKEN or not to or not message:
+        return False
+    to = to.strip()
+    token = YUQUE2GIT_DISCORD_BOT_TOKEN.strip()
+    headers = {"Authorization": f"Bot {token}", "Content-Type": "application/json"}
+    base = YUQUE2GIT_DISCORD_API_BASE
+    chunks = _split_discord_message_content(message)
+
+    channel_id: Optional[str] = None
+    if to.startswith("channel:"):
+        channel_id = to[8:].strip()
+    elif to.startswith("user:"):
+        uid = to[5:].strip()
+        dm_url = f"{base}/users/@me/channels"
+        channel_id = ""
+        for attempt in range(YUQUE2GIT_DELIVER_MAX_RETRIES + 1):
+            try:
+                r = await client.post(dm_url, headers=headers, json={"recipient_id": uid})
+            except (httpx.TimeoutException, httpx.RequestError) as e:
+                if attempt < YUQUE2GIT_DELIVER_MAX_RETRIES:
+                    await asyncio.sleep(2**attempt)
+                    continue
+                logger.warning("Discord create DM failed: %s", e)
+                return False
+            if r.status_code == 429 and attempt < YUQUE2GIT_DELIVER_MAX_RETRIES:
+                wait = 1.0
+                try:
+                    data429 = r.json() if r.content else {}
+                    if isinstance(data429.get("retry_after"), (int, float)):
+                        wait = float(data429["retry_after"])
+                except Exception:
+                    wait = 2**attempt
+                await asyncio.sleep(min(wait, 60.0))
+                continue
+            if r.status_code >= 400:
+                logger.warning("Discord create DM returned %s: %s", r.status_code, (r.text or "")[:200])
+                return False
+            try:
+                data = r.json() if r.content else {}
+            except Exception:
+                data = {}
+            channel_id = str(data.get("id") or "")
+            break
+        if not channel_id:
+            return False
+    else:
+        return False
+
+    msg_url = f"{base}/channels/{channel_id}/messages"
+    for part in chunks:
+        ok = await _discord_api_post_with_retry(
+            client,
+            "POST",
+            msg_url,
+            headers=headers,
+            json_body={"content": part},
+        )
+        if not ok:
+            return False
+    return True
 
 
 async def _send_napcat_message(client: httpx.AsyncClient, channel: str, to: str, message: str) -> bool:
@@ -1646,78 +1976,112 @@ async def _openclaw_callback(
 
 
 async def _deliver_openclaw_summary(summary: Dict[str, Any]) -> bool:
-    """将服务端拼装好的摘要投递给配置目标。若配置了直连 URL 则走 Napcat；否则走 Gateway。返回是否全部投递成功。"""
+    """投递摘要：qq→Napcat（若配 URL）、discord→Discord Bot REST（若配 Token）；其余走 OpenClaw /hooks/agent。"""
     deliver_targets = _parse_deliver_targets()
     if not deliver_targets:
         return False
     message = _format_openclaw_summary(summary)
+    direct_targets, gateway_targets = _partition_deliver_targets(deliver_targets)
+    all_ok = True
 
-    if YUQUE2GIT_DIRECT_SEND_URL:
-        # 直连 Napcat：仅支持 channel=qq，to 为 g:群号 或 p:QQ号
-        valid = []
-        for t in deliver_targets:
-            channel, to = t.get("channel", "").strip(), t.get("to", "").strip()
-            if channel != "qq":
-                logger.warning("Direct send: skipping non-qq target %s/%s", channel, to)
-                continue
-            if not (to.startswith("g:") or to.startswith("p:")) or not (to[2:].strip().isdigit()):
-                logger.warning("Direct send: skipping unsupported to %r", to)
-                continue
-            valid.append({"channel": channel, "to": to})
-        if not valid:
-            return False
-        all_ok = True
+    async def _direct_one(
+        client_qq: httpx.AsyncClient,
+        client_discord: httpx.AsyncClient,
+        ch: str,
+        to: str,
+    ) -> bool:
+        if ch == "qq":
+            return await _send_napcat_message(client_qq, ch, to, message)
+        if ch == "discord":
+            return await _send_discord_direct_message(client_discord, to, message)
+        return False
+
+    if direct_targets:
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                for i, t in enumerate(valid):
-                    if i > 0 and YUQUE2GIT_DELIVER_DELAY_SECONDS > 0 and len(valid) > 1:
-                        await asyncio.sleep(YUQUE2GIT_DELIVER_DELAY_SECONDS)
-                    channel, to = t["channel"], t["to"]
-                    last_reason = "unknown"
-                    for attempt in range(YUQUE2GIT_DELIVER_MAX_RETRIES + 1):
-                        try:
-                            ok = await _send_napcat_message(client, channel, to, message)
-                        except (httpx.TimeoutException, httpx.RequestError) as e:
-                            last_reason = f"request_error:{type(e).__name__}"
+            # trust_env=False：不继承进程级 HTTP(S)_PROXY，避免语雀/OpenClaw/内网 Napcat 被误走代理
+            _dp = YUQUE2GIT_DISCORD_HTTP_PROXY or None
+            async with httpx.AsyncClient(timeout=45.0, trust_env=False) as client_qq:
+                async with httpx.AsyncClient(
+                    timeout=45.0,
+                    trust_env=False,
+                    proxy=_dp,
+                ) as client_discord:
+                    for i, t in enumerate(direct_targets):
+                        if i > 0 and YUQUE2GIT_DELIVER_DELAY_SECONDS > 0 and len(direct_targets) > 1:
+                            await asyncio.sleep(YUQUE2GIT_DELIVER_DELAY_SECONDS)
+                        ch, to = t["channel"], t["to"]
+                        last_reason = "direct_api_failed"
+                        for attempt in range(YUQUE2GIT_DELIVER_MAX_RETRIES + 1):
+                            try:
+                                ok = await _direct_one(client_qq, client_discord, ch, to)
+                            except (httpx.TimeoutException, httpx.RequestError) as e:
+                                last_reason = f"request_error:{type(e).__name__}"
+                                ok = False
+                            if ok:
+                                logger.info("Direct send summary delivered to %s/%s", ch, to)
+                                break
                             if attempt < YUQUE2GIT_DELIVER_MAX_RETRIES:
-                                wait = 2 ** attempt
-                                logger.warning("Direct send retry after %ss (attempt %s/%s): %s", wait, attempt + 1, YUQUE2GIT_DELIVER_MAX_RETRIES + 1, e)
+                                wait = 2**attempt
+                                logger.warning(
+                                    "Direct send %s/%s failed, retry after %ss (attempt %s/%s)",
+                                    ch,
+                                    to,
+                                    wait,
+                                    attempt + 1,
+                                    YUQUE2GIT_DELIVER_MAX_RETRIES + 1,
+                                )
                                 await asyncio.sleep(wait)
                                 continue
                             all_ok = False
+                            evt_type = (
+                                "openclaw_summary_delivery_exception"
+                                if last_reason.startswith("request_error")
+                                else "openclaw_summary_delivery_failed"
+                            )
                             if OUTPUT_DIR:
-                                _append_pending_push_event(OUTPUT_DIR, {"type": "openclaw_summary_delivery_exception", "reason": last_reason, "summary": summary, "target_channel": channel, "target_to": to, "next_action": "replay_needed"})
-                            break
-                        if not ok:
-                            last_reason = "napcat_api_failed"
-                            if attempt < YUQUE2GIT_DELIVER_MAX_RETRIES:
-                                wait = 2 ** attempt
-                                logger.warning("Direct send %s/%s failed, retry after %ss (attempt %s/%s)", channel, to, wait, attempt + 1, YUQUE2GIT_DELIVER_MAX_RETRIES + 1)
-                                await asyncio.sleep(wait)
-                                continue
-                            all_ok = False
-                            if OUTPUT_DIR:
-                                _append_pending_push_event(OUTPUT_DIR, {"type": "openclaw_summary_delivery_failed", "reason": last_reason, "summary": summary, "target_channel": channel, "target_to": to, "next_action": "replay_needed"})
-                            break
-                        logger.info("Direct send summary delivered to %s/%s", channel, to)
-                        break
+                                _append_pending_push_event(
+                                    OUTPUT_DIR,
+                                    {
+                                        "type": evt_type,
+                                        "reason": last_reason,
+                                        "summary": summary,
+                                        "target_channel": ch,
+                                        "target_to": to,
+                                        "next_action": "replay_needed",
+                                    },
+                                )
         except Exception as e:
             logger.warning("Direct send summary deliver failed: %s", e)
             all_ok = False
             if OUTPUT_DIR:
-                _append_pending_push_event(OUTPUT_DIR, {"type": "openclaw_summary_delivery_exception", "reason": type(e).__name__, "summary": summary, "next_action": "replay_needed"})
+                _append_pending_push_event(
+                    OUTPUT_DIR,
+                    {
+                        "type": "openclaw_summary_delivery_exception",
+                        "reason": type(e).__name__,
+                        "summary": summary,
+                        "next_action": "replay_needed",
+                    },
+                )
+
+    if not gateway_targets:
         return all_ok
 
     if not _is_openclaw_hooks_agent_url(OPENCLAW_CALLBACK_URL):
+        logger.warning(
+            "Summary deliver: %d target(s) need OpenClaw hooks but OPENCLAW_CALLBACK_URL is not /hooks/agent",
+            len(gateway_targets),
+        )
         return False
-    headers = {}
+
+    headers: Dict[str, str] = {}
     if OPENCLAW_HOOKS_TOKEN:
         headers["Authorization"] = f"Bearer {OPENCLAW_HOOKS_TOKEN}"
     bodies = [
         {"message": message, "name": "yuque2git", "deliver": True, "channel": t["channel"], "to": t["to"]}
-        for t in deliver_targets
+        for t in gateway_targets
     ]
-    all_ok = True
+    gateway_ok = True
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             for i, body in enumerate(bodies):
@@ -1730,40 +2094,92 @@ async def _deliver_openclaw_summary(summary: Dict[str, Any]) -> bool:
                     except (httpx.TimeoutException, httpx.RequestError) as e:
                         last_reason = f"request_error:{type(e).__name__}"
                         if attempt < YUQUE2GIT_DELIVER_MAX_RETRIES:
-                            wait = 2 ** attempt
-                            logger.warning("OpenClaw summary deliver retry after %ss (attempt %s/%s): %s", wait, attempt + 1, YUQUE2GIT_DELIVER_MAX_RETRIES + 1, e)
+                            wait = 2**attempt
+                            logger.warning(
+                                "OpenClaw summary deliver retry after %ss (attempt %s/%s): %s",
+                                wait,
+                                attempt + 1,
+                                YUQUE2GIT_DELIVER_MAX_RETRIES + 1,
+                                e,
+                            )
                             await asyncio.sleep(wait)
                             continue
-                        all_ok = False
+                        gateway_ok = False
                         if OUTPUT_DIR:
-                            _append_pending_push_event(OUTPUT_DIR, {"type": "openclaw_summary_delivery_exception", "reason": last_reason, "summary": summary, "request_body": body, "next_action": "replay_needed"})
+                            _append_pending_push_event(
+                                OUTPUT_DIR,
+                                {
+                                    "type": "openclaw_summary_delivery_exception",
+                                    "reason": last_reason,
+                                    "summary": summary,
+                                    "request_body": body,
+                                    "next_action": "replay_needed",
+                                },
+                            )
                         break
                     if r.status_code == 429 or r.status_code >= 500:
                         last_reason = f"http_{r.status_code}"
                         if attempt < YUQUE2GIT_DELIVER_MAX_RETRIES:
-                            wait = 2 ** attempt
-                            logger.warning("OpenClaw summary deliver %s, retry after %ss (attempt %s/%s)", r.status_code, wait, attempt + 1, YUQUE2GIT_DELIVER_MAX_RETRIES + 1)
+                            wait = 2**attempt
+                            logger.warning(
+                                "OpenClaw summary deliver %s, retry after %ss (attempt %s/%s)",
+                                r.status_code,
+                                wait,
+                                attempt + 1,
+                                YUQUE2GIT_DELIVER_MAX_RETRIES + 1,
+                            )
                             await asyncio.sleep(wait)
                             continue
-                        all_ok = False
+                        gateway_ok = False
                         logger.warning("OpenClaw summary deliver returned %s: %s", r.status_code, (r.text or "")[:200])
                         if OUTPUT_DIR:
-                            _append_pending_push_event(OUTPUT_DIR, {"type": "openclaw_summary_delivery_failed", "reason": last_reason, "summary": summary, "request_body": body, "next_action": "replay_needed"})
+                            _append_pending_push_event(
+                                OUTPUT_DIR,
+                                {
+                                    "type": "openclaw_summary_delivery_failed",
+                                    "reason": last_reason,
+                                    "summary": summary,
+                                    "request_body": body,
+                                    "next_action": "replay_needed",
+                                },
+                            )
                         break
                     if r.status_code >= 400:
-                        all_ok = False
+                        gateway_ok = False
                         logger.warning("OpenClaw summary deliver returned %s: %s", r.status_code, (r.text or "")[:200])
                         if OUTPUT_DIR:
-                            _append_pending_push_event(OUTPUT_DIR, {"type": "openclaw_summary_delivery_failed", "reason": f"http_{r.status_code}", "summary": summary, "request_body": body, "next_action": "replay_needed"})
+                            _append_pending_push_event(
+                                OUTPUT_DIR,
+                                {
+                                    "type": "openclaw_summary_delivery_failed",
+                                    "reason": f"http_{r.status_code}",
+                                    "summary": summary,
+                                    "request_body": body,
+                                    "next_action": "replay_needed",
+                                },
+                            )
                         break
-                    logger.info("OpenClaw summary delivered to %s/%s (status=%s)", body.get("channel"), body.get("to"), r.status_code)
+                    logger.info(
+                        "OpenClaw summary delivered to %s/%s (status=%s)",
+                        body.get("channel"),
+                        body.get("to"),
+                        r.status_code,
+                    )
                     break
     except Exception as e:
         logger.warning("OpenClaw summary deliver failed: %s", e)
-        all_ok = False
+        gateway_ok = False
         if OUTPUT_DIR:
-            _append_pending_push_event(OUTPUT_DIR, {"type": "openclaw_summary_delivery_exception", "reason": type(e).__name__, "summary": summary, "next_action": "replay_needed"})
-    return all_ok
+            _append_pending_push_event(
+                OUTPUT_DIR,
+                {
+                    "type": "openclaw_summary_delivery_exception",
+                    "reason": type(e).__name__,
+                    "summary": summary,
+                    "next_action": "replay_needed",
+                },
+            )
+    return all_ok and gateway_ok
 
 
 # --- FastAPI ---
@@ -1854,14 +2270,15 @@ async def mark_pushed(body: MarkPushedBody):
         return Response(status_code=400, content="summary missing or invalid")
     if body.should_push:
         data = _read_last_push(OUTPUT_DIR)
-        # 幂等：该 commit 已记录并推送过则不再重复 deliver，避免同文档短时多次推送
+        # 幂等：该 commit 已成功投递过则不再重复 deliver（须在投递成功后再写盘，见下）
         if data.get(str(resolved_yuque_id)) == body.commit:
             return {"ok": True, "yuque_id": resolved_yuque_id, "commit": body.commit, "delivered": False}
-        data[str(resolved_yuque_id)] = body.commit
-        _write_last_push(OUTPUT_DIR, data)
         delivered = await _deliver_openclaw_summary(validated_summary)
-        if delivered and YUQUE2GIT_OPENCLAW_COOLDOWN_SECONDS > 0 and OUTPUT_DIR:
-            _record_openclaw_push_cooldown_now(OUTPUT_DIR, resolved_yuque_id)
+        if delivered:
+            data[str(resolved_yuque_id)] = body.commit
+            _write_last_push(OUTPUT_DIR, data)
+            if YUQUE2GIT_OPENCLAW_COOLDOWN_SECONDS > 0 and OUTPUT_DIR:
+                _record_openclaw_push_cooldown_now(OUTPUT_DIR, resolved_yuque_id)
         return {"ok": True, "yuque_id": resolved_yuque_id, "commit": body.commit, "delivered": delivered}
     return {"ok": True, "yuque_id": resolved_yuque_id, "commit": body.commit, "delivered": False}
 
@@ -1940,10 +2357,9 @@ async def webhook(request: Request):
             if old_full.exists():
                 old_full.unlink()
                 _git_add_commit(OUTPUT_DIR, [old_path], f"yuque: remove old path (move) id={data.id}")
-        author_name = await _resolve_author_name(
-            client, OUTPUT_DIR, detail, (data.actor.name if data.actor else "")
-        )
-        content = _build_md(detail, author_name)
+        author_name = await _resolve_author_name(client, OUTPUT_DIR, detail)
+        members = _read_members(OUTPUT_DIR)
+        content = _build_md(detail, author_name, members)
         out_file.write_text(content, encoding="utf-8")
         index[str(data.id)] = rel_path
         _write_index(OUTPUT_DIR, index)
