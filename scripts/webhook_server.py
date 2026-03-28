@@ -5,7 +5,10 @@ yuque2git Webhook 服务：接收语雀 Webhook，写本地 Markdown + Git commi
 import argparse
 import asyncio
 import difflib
-import fcntl
+try:
+    import fcntl
+except ImportError:
+    fcntl = None  # Windows 不支持，仅 replay 功能需要
 import json
 import logging
 import os
@@ -286,6 +289,157 @@ def _parent_path_from_toc(toc_list: List[Dict], doc_id: int, doc_slug: Optional[
 
     parts = [segment_name(p) for p in ancestors(target)]
     return "/".join(parts) if parts else ""
+
+
+def _toc_list_children(parent_uuid: Optional[str], toc_by_uuid: Dict[str, Dict]) -> List[Dict]:
+    """返回父节点下的子节点列表（按语雀 child_uuid/sibling_uuid 链表顺序）。"""
+    out: List[Dict] = []
+    if parent_uuid is None:
+        roots = [n for n in toc_by_uuid.values() if n.get("parent_uuid") in (None, "")]
+        if not roots:
+            return out
+        # 找到链表头：没有 sibling_uuid 指向的节点
+        sibling_targets = {n.get("sibling_uuid") for n in roots if n.get("sibling_uuid")}
+        first_uuid = None
+        for n in roots:
+            u = n.get("uuid")
+            if u and u not in sibling_targets:
+                first_uuid = u
+                break
+        if first_uuid:
+            node = toc_by_uuid.get(first_uuid)
+            while node:
+                out.append(node)
+                next_uuid = node.get("sibling_uuid")
+                node = toc_by_uuid.get(next_uuid) if next_uuid else None
+        if len(out) != len(roots):
+            out = roots  # fallback
+    else:
+        parent = toc_by_uuid.get(parent_uuid)
+        start_uuid = parent.get("child_uuid") if parent else None
+        if start_uuid and start_uuid in toc_by_uuid:
+            node = toc_by_uuid[start_uuid]
+            while node:
+                if node.get("parent_uuid") == parent_uuid:
+                    out.append(node)
+                next_uuid = node.get("sibling_uuid")
+                node = toc_by_uuid.get(next_uuid) if next_uuid else None
+        if not out:
+            # fallback: 遍历所有
+            for n in toc_by_uuid.values():
+                if n.get("parent_uuid") == parent_uuid:
+                    out.append(n)
+    return out
+
+
+def _sync_repo_path_drift(
+    output_dir: Path,
+    repo_dir_name: str,
+    toc_list: List[Dict],
+    index: Dict[str, str],
+) -> List[Tuple[str, str]]:
+    """
+    遍历 TOC，计算所有文档新路径，执行路径漂移修正。
+    返回移动列表 [(old_path, new_path), ...]。
+    """
+    if not toc_list:
+        return []
+
+    # 1. 构建索引
+    toc_by_uuid: Dict[str, Dict] = {n["uuid"]: n for n in toc_list if n.get("uuid")}
+
+    # 2. 递归计算所有 DOC/SHEET 的路径
+    computed_paths: Dict[int, str] = {}  # yuque_id -> new_rel_path
+    used_bases: Dict[Tuple[str, str], set] = {}  # (repo_dir, parent_path) -> set of base names
+
+    def resolve_basename(repo_dir: str, parent_path: str, base: str) -> str:
+        """路径漂移时的重名处理：优先 base.md，冲突时用 base_2.md 等。"""
+        key = (repo_dir, parent_path)
+        used = used_bases.setdefault(key, set())
+        stem = base
+        if stem in used:
+            i = 2
+            while f"{stem}_{i}" in used:
+                i += 1
+            stem = f"{stem}_{i}"
+        used.add(stem)
+        return stem + ".md"
+
+    def traverse_toc(items: List[Dict], parent_path: str):
+        """递归遍历 TOC，计算路径。"""
+        for item in items:
+            doc_type = item.get("type", "")
+            yuque_id = item.get("id")
+            if isinstance(yuque_id, str) and yuque_id.isdigit():
+                yuque_id = int(yuque_id)
+
+            if doc_type in ("DOC", "SHEET"):
+                # 计算文件名
+                slug = item.get("url") or item.get("slug") or item.get("uuid", "")
+                title = item.get("title", "")
+                base = _slug_safe(title or slug) or "untitled"
+                doc_filename = resolve_basename(repo_dir_name, parent_path, base)
+
+                # 完整相对路径
+                if parent_path:
+                    rel_path = f"{repo_dir_name}/{parent_path}/{doc_filename}"
+                else:
+                    rel_path = f"{repo_dir_name}/{doc_filename}"
+
+                if yuque_id is not None:
+                    computed_paths[yuque_id] = rel_path
+
+                # DOC/SHEET 也可能有子节点
+                children = _toc_list_children(item.get("uuid"), toc_by_uuid)
+                if children:
+                    seg = _slug_safe(title or item.get("uuid", ""))
+                    child_parent = f"{parent_path}/{seg}" if parent_path else seg
+                    traverse_toc(children, child_parent)
+
+            elif doc_type == "TITLE":
+                # 纯目录，继续递归
+                seg = _slug_safe(item.get("title") or item.get("uuid", ""))
+                next_parent = f"{parent_path}/{seg}" if parent_path else seg
+                children = _toc_list_children(item.get("uuid"), toc_by_uuid)
+                traverse_toc(children, next_parent)
+
+    # 从根节点开始遍历
+    roots = _toc_list_children(None, toc_by_uuid)
+    traverse_toc(roots, "")
+
+    # 3. 对比并收集移动
+    moves: List[Tuple[str, str]] = []
+    for yuque_id, new_path in computed_paths.items():
+        old_path = index.get(str(yuque_id))
+        if old_path and old_path != new_path:
+            old_file = output_dir / old_path
+            new_file = output_dir / new_path
+            if old_file.exists():
+                # 确保新目录存在
+                new_file.parent.mkdir(parents=True, exist_ok=True)
+                moves.append((old_path, new_path))
+                index[str(yuque_id)] = new_path
+                logger.info("Path drift: %s -> %s (id=%s)", old_path, new_path, yuque_id)
+
+    # 4. 执行 git mv
+    for old_path, new_path in moves:
+        try:
+            subprocess.run(
+                ["git", "mv", "--", old_path, new_path],
+                cwd=output_dir,
+                check=True,
+                capture_output=True,
+            )
+        except subprocess.CalledProcessError as e:
+            logger.warning("git mv failed: %s -> %s: %s", old_path, new_path, e.stderr.decode() if e.stderr else str(e))
+
+    # 5. 写入索引并 Git commit（如果有移动）
+    if moves:
+        _write_index(output_dir, index)
+        moved_paths = [new for _, new in moves]
+        _git_add_commit(output_dir, moved_paths + [IDX_FILE], "yuque: path drift correction")
+
+    return moves
 
 
 # 仅写入 Obsidian 友好 + 同步必需的少量属性，避免冗余（type/body_*/book 嵌套/统计/多时间戳等）
@@ -901,12 +1055,13 @@ async def _replay_pending_async(output_dir: Path, limit: int) -> Tuple[int, int,
         logger.error("replay: cannot open lock file %s: %s", lock_path, e)
         return 0, 0, 0
 
-    try:
-        fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
-    except OSError as e:
-        logger.error("replay: cannot acquire lock: %s", e)
-        lock_f.close()
-        return 0, 0, 0
+    if fcntl:
+        try:
+            fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+        except OSError as e:
+            logger.error("replay: cannot acquire lock: %s", e)
+            lock_f.close()
+            return 0, 0, 0
 
     done_keys: set = set()
     replay_candidates: List[Dict[str, Any]] = []
@@ -916,7 +1071,8 @@ async def _replay_pending_async(output_dir: Path, limit: int) -> Tuple[int, int,
         lines = p.read_text(encoding="utf-8").strip().split("\n")
     except Exception as e:
         logger.error("replay: read pending file failed: %s", e)
-        fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
+        if fcntl:
+            fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
         lock_f.close()
         return 0, 0, 0
 
@@ -1140,10 +1296,11 @@ async def _replay_pending_async(output_dir: Path, limit: int) -> Tuple[int, int,
                 )
             continue
 
-    try:
-        fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
-    except OSError:
-        pass
+    if fcntl:
+        try:
+            fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
     lock_f.close()
     logger.info(
         "replay finished done=%s retry_failed=%s invalid_payload=%s",
@@ -2319,6 +2476,13 @@ async def webhook(request: Request):
         except Exception as e:
             logger.warning("get_repo_toc failed for repo_id=%s: %s", repo_id, e)
             return Response(status_code=200, content="ok")  # 避免语雀反复重试
+
+        # 路径漂移修正：父 DOC 移动后子 DOC 路径同步更新
+        _ensure_git(OUTPUT_DIR)
+        index = _read_index(OUTPUT_DIR)
+        drift_moves = _sync_repo_path_drift(OUTPUT_DIR, repo_dir_name, toc_list, index)
+        if drift_moves:
+            logger.info("Path drift sync: moved %s docs", len(drift_moves))
 
         if not slug:
             for n in toc_list:

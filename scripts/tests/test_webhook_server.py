@@ -28,6 +28,8 @@ from webhook_server import (
     _render_lakesheet_markdown,
     _llm_should_push,
     _openclaw_callback,
+    _sync_repo_path_drift,
+    _toc_list_children,
     _format_openclaw_summary,
     _render_openclaw_message_template,
     _validate_openclaw_summary,
@@ -105,6 +107,121 @@ class TestParentPathFromToc:
         ]
         assert _parent_path_from_toc(toc, 1, "a") == "C"
         assert _parent_path_from_toc(toc, 2, "b") == "C/A"
+
+
+class TestTocListChildren:
+    def test_root_nodes(self):
+        """根节点（parent_uuid 为 None）"""
+        toc_by_uuid = {
+            "u1": {"uuid": "u1", "id": 1, "title": "A", "parent_uuid": None},
+            "u2": {"uuid": "u2", "id": 2, "title": "B", "parent_uuid": None, "sibling_uuid": "u1"},
+        }
+        children = _toc_list_children(None, toc_by_uuid)
+        assert len(children) == 2
+
+    def test_children_under_parent(self):
+        """父节点下的子节点"""
+        toc_by_uuid = {
+            "parent": {"uuid": "parent", "id": 1, "title": "P", "parent_uuid": None, "child_uuid": "c1"},
+            "c1": {"uuid": "c1", "id": 2, "title": "C1", "parent_uuid": "parent", "sibling_uuid": "c2"},
+            "c2": {"uuid": "c2", "id": 3, "title": "C2", "parent_uuid": "parent"},
+        }
+        children = _toc_list_children("parent", toc_by_uuid)
+        assert len(children) == 2
+        assert children[0]["uuid"] == "c1"
+        assert children[1]["uuid"] == "c2"
+
+
+class TestSyncRepoPathDrift:
+    def test_moves_child_doc_when_parent_moved(self, tmp_path):
+        """父 DOC 移动后，子 DOC 路径应同步更新"""
+        # 初始化 Git 仓库
+        subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@test"], cwd=tmp_path, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True, capture_output=True)
+
+        # 创建旧目录结构和文件
+        old_parent_dir = tmp_path / "Repo" / "OldParent"
+        old_parent_dir.mkdir(parents=True, exist_ok=True)
+
+        # 父文档
+        parent_md = old_parent_dir / "Parent.md"
+        parent_md.write_text("---\nid: 1\ntitle: Parent\n---\n\nParent content\n", encoding="utf-8")
+
+        # 子文档（在父文档的子目录下）
+        old_child_dir = old_parent_dir / "Parent"
+        old_child_dir.mkdir(parents=True, exist_ok=True)
+        child_md = old_child_dir / "Child.md"
+        child_md.write_text("---\nid: 2\ntitle: Child\n---\n\nChild content\n", encoding="utf-8")
+
+        # 初始 commit
+        subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "initial"], cwd=tmp_path, check=True, capture_output=True)
+
+        # 初始索引
+        index = {
+            "1": "Repo/OldParent/Parent.md",
+            "2": "Repo/OldParent/Parent/Child.md",
+        }
+
+        # 新的 TOC：父文档移动到 NewParent 目录下
+        # 结构：TITLE(NewParent) -> DOC(Parent, id=1) -> DOC(Child, id=2)
+        toc = [
+            {"uuid": "u_title", "type": "TITLE", "title": "NewParent", "parent_uuid": None, "child_uuid": "u_parent"},
+            {"uuid": "u_parent", "type": "DOC", "id": 1, "url": "parent", "title": "Parent", "parent_uuid": "u_title", "child_uuid": "u_child"},
+            {"uuid": "u_child", "type": "DOC", "id": 2, "url": "child", "title": "Child", "parent_uuid": "u_parent"},
+        ]
+
+        # 执行路径漂移修正
+        moves = _sync_repo_path_drift(tmp_path, "Repo", toc, index)
+
+        # 验证
+        assert len(moves) == 2  # 父和子都移动了
+
+        # 父文档新路径
+        new_parent_path = tmp_path / "Repo" / "NewParent" / "Parent.md"
+        assert new_parent_path.exists()
+        assert "Parent content" in new_parent_path.read_text(encoding="utf-8")
+
+        # 子文档新路径
+        new_child_path = tmp_path / "Repo" / "NewParent" / "Parent" / "Child.md"
+        assert new_child_path.exists()
+        assert "Child content" in new_child_path.read_text(encoding="utf-8")
+
+        # 旧文件已不存在
+        assert not parent_md.exists()
+        assert not child_md.exists()
+
+        # 索引已更新
+        assert index["1"] == "Repo/NewParent/Parent.md"
+        assert index["2"] == "Repo/NewParent/Parent/Child.md"
+
+    def test_no_move_when_path_unchanged(self, tmp_path):
+        """路径未变化时不移动"""
+        subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@test"], cwd=tmp_path, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True, capture_output=True)
+
+        # 创建文件
+        doc_dir = tmp_path / "Repo"
+        doc_dir.mkdir(parents=True, exist_ok=True)
+        doc_md = doc_dir / "Doc.md"
+        doc_md.write_text("---\nid: 1\ntitle: Doc\n---\n\nContent\n", encoding="utf-8")
+
+        subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "initial"], cwd=tmp_path, check=True, capture_output=True)
+
+        index = {"1": "Repo/Doc.md"}
+
+        # TOC 与当前结构一致
+        toc = [
+            {"uuid": "u1", "type": "DOC", "id": 1, "url": "doc", "title": "Doc", "parent_uuid": None},
+        ]
+
+        moves = _sync_repo_path_drift(tmp_path, "Repo", toc, index)
+
+        assert len(moves) == 0
+        assert doc_md.exists()
 
 
 class TestBuildMd:
