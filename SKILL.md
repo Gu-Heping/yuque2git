@@ -72,11 +72,13 @@ metadata: '{"openclaw":{"requires":{"bins":["python3"],"env":["YUQUE_TOKEN"]},"h
 | `OPENCLAW_CALLBACK_URL` | 待判定事件 POST 的 URL。**推荐**填 OpenClaw Gateway 的 Hooks 入口：`http(s)://<gateway>:<port>/hooks/agent`，则走官方 Hooks 协议（message + Bearer） |
 | `OPENCLAW_HOOKS_TOKEN` | 当 URL 为 `/hooks/agent` 时必填，与 `~/.openclaw/openclaw.json` 的 `hooks.token` 一致，用于 `Authorization: Bearer` |
 | `YUQUE2GIT_PUBLIC_URL` | 可选。yuque2git 服务对外可访问的 base URL（如 `http://host:8765`），写入 prompt 供 OpenClaw Agent 回调 `POST /mark-pushed`；未设则 prompt 中为占位说明 |
-| `YUQUE2GIT_DELIVER_CHANNEL` | 与 `YUQUE2GIT_DELIVER_TO` 配合；设置后 yuque2git 请求 Gateway Hooks 时会带 `deliver: true` 及 channel/to；channel 填 OpenClaw 通道名如 `qq` |
-| `YUQUE2GIT_DELIVER_TO` | 可选。投递目标，支持**多选**：逗号分隔多个 ID（如 `1179350197,群ID2`），同一 channel 下会收到同一条回复 |
-| `YUQUE2GIT_DELIVER_TARGETS` | 可选。多目标 JSON 数组，覆盖 CHANNEL+TO。例：`[{"channel":"qq","to":"g:1087044655"},{"channel":"qq","to":"p:1179350197"}]`。群为 `g:群号`，私聊为 `p:QQ号`；直连时与 Napcat 的 group_id/user_id 对应 |
-| `YUQUE2GIT_DIRECT_SEND_URL` | 可选。直连投递时 Napcat OneBot 11 HTTP API 的 base URL（如 `http://127.0.0.1:3000`）。**非空时**摘要由 yuque2git 直连 Napcat 发送，不经 Gateway Agent 轮次，QQ 收到 OpenClaw 生成的摘要原文 |
-| `YUQUE2GIT_DIRECT_SEND_TOKEN` | 可选。与 Napcat HTTP 服务配置的 token 一致时，直连请求头加 `Authorization: Bearer <token>` |
+| `YUQUE2GIT_DELIVER_CHANNEL` | 与 `YUQUE2GIT_DELIVER_TO` 配合；设置后 yuque2git 请求 Gateway Hooks 时会带 `deliver: true` 及 channel/to；channel 填 OpenClaw 通道名如 `qq`、`discord` |
+| `YUQUE2GIT_DELIVER_TO` | 可选。投递目标，支持**多选**：逗号分隔多个 to（同一 channel）。QQ：`g:群号` / `p:QQ号`。Discord：`channel:频道snowflake` 或 `user:用户snowflake`（与 OpenClaw Hooks 文档一致） |
+| `YUQUE2GIT_DELIVER_TARGETS` | 可选。多目标 JSON 数组，覆盖 CHANNEL+TO。例：`[{"channel":"qq","to":"g:1087044655"},{"channel":"discord","to":"channel:123456789012345678"}]` |
+| `YUQUE2GIT_DIRECT_SEND_URL` | 可选。Napcat OneBot 11 HTTP 基址；**非空且目标为 qq** 时摘要直连 Napcat，不经 Gateway 投递轮次 |
+| `YUQUE2GIT_DIRECT_SEND_TOKEN` | 可选。Napcat HTTP `Authorization: Bearer` |
+| `YUQUE2GIT_DISCORD_BOT_TOKEN` | 可选。Discord Bot Token；**非空且目标为 discord** 时摘要直连 Discord REST。未设置时可回退读 `DISCORD_BOT_TOKEN` |
+| `YUQUE2GIT_DISCORD_API_BASE` | 可选。默认 `https://discord.com/api/v10` |
 | `YUQUE2GIT_OPENCLAW_MIN_DIFF_CHARS` | 可选。大于 0 时 diff 字符数低于该值则不调用 OpenClaw；`0` 关闭 |
 | `YUQUE2GIT_OPENCLAW_COOLDOWN_SECONDS` | 可选。大于 0 时成功投递摘要后同 `yuque_id` 在冷却期内不再调用 OpenClaw；时间戳在 `OUTPUT_DIR/.yuque-openclaw-push-cooldown.json` |
 | `YUQUE2GIT_OPENCLAW_COOLDOWN_BYPASS_CHARS` | 可选。冷却期内 diff 字符数 ≥ 此值仍调用 OpenClaw；`0` 不绕过 |
@@ -132,8 +134,8 @@ metadata: '{"openclaw":{"requires":{"bins":["python3"],"env":["YUQUE_TOKEN"]},"h
 - **Diff 基准**：以「最后推送时的文档状态」与当前状态做 diff，由 AI 或 OpenClaw 判定是否推送。
 - **LLM 模式**（`PUSH_DECISION_MODE=llm`）：服务内调 LLM 得 YES/NO 与可选更新总结；需配置 `OPENAI_API_KEY` 等。无实质变更（diff 为「无文本变更」或「文档移动内容无变更」）时**不调 LLM**，直接不推送以省 token。默认只对**正文**做 diff（`ENABLE_BODY_ONLY_DIFF=true`），若推送则调用 `NOTIFY_URL` 并更新 last-push。
 - **OpenClaw 模式**（`PUSH_DECISION_MODE=openclaw`）：将待判定事件 POST 到 `OPENCLAW_CALLBACK_URL`，由 OpenClaw Agent 判定后回调 `POST /mark-pushed`，body 须含 `yuque_id`、`commit`、`should_push`；当 `should_push=true` 时还须带 `summary`，含 `title`、`repo_name`、`author`、`doc_url`、`highlights`（1～3 条）。
-  - **接入 OpenClaw Gateway Hooks**（推荐）：将 `OPENCLAW_CALLBACK_URL` 设为 `http(s)://<gateway>:<port>/hooks/agent`，并配置 `OPENCLAW_HOOKS_TOKEN`（与 openclaw 的 `hooks.token` 一致）、可选 `YUQUE2GIT_PUBLIC_URL`。若希望投递到 QQ，设置 `YUQUE2GIT_DELIVER_CHANNEL=qq` 与 `YUQUE2GIT_DELIVER_TO=<群ID或用户ID>`（群为 `g:群号`，私聊为 `p:QQ号`）。Agent 须先向 `/mark-pushed` 回调结构化 JSON，由 yuque2git 统一生成并投递最终文案；自定义 prompt 可用 `YUQUE2GIT_OPENCLAW_MESSAGE_TEMPLATE`，占位符见上表，其中 `{reply_contract}` 为 Agent 须遵守的 JSON 契约说明。OpenClaw 侧在 `~/.openclaw/openclaw.json` 的 `hooks` 下启用 Hooks（`hooks.enabled: true`、`hooks.token: "<共享密钥>"`），并确保 main（或目标）Agent 能访问 yuque2git（如通过 `exec` 执行 `curl` 调用 `YUQUE2GIT_PUBLIC_URL/mark-pushed`），网络允许 Gateway 访问 yuque2git 服务。
-  - **直连发 QQ（B 方案）**：设置 `YUQUE2GIT_DIRECT_SEND_URL`（如 `http://127.0.0.1:3000`）后，摘要由 yuque2git 直连 Napcat 的 OneBot 11 API 发送，不经 Gateway 的 Agent 投递轮次，QQ 收到的是 OpenClaw 回调中的摘要原文；可选 `YUQUE2GIT_DIRECT_SEND_TOKEN` 与 Napcat HTTP token 一致。yuque2git 需能访问 Napcat 端口（本机或宿主机映射）。
+  - **接入 OpenClaw Gateway Hooks**（推荐）：将 `OPENCLAW_CALLBACK_URL` 设为 `http(s)://<gateway>:<port>/hooks/agent`，并配置 `OPENCLAW_HOOKS_TOKEN`（与 openclaw 的 `hooks.token` 一致）、可选 `YUQUE2GIT_PUBLIC_URL`。投递目标：QQ 用 `YUQUE2GIT_DELIVER_CHANNEL=qq` 与 `YUQUE2GIT_DELIVER_TO`（`g:群号` / `p:QQ号`）；**Discord** 用 `YUQUE2GIT_DELIVER_CHANNEL=discord` 与 `YUQUE2GIT_DELIVER_TO=channel:<频道ID>`（或 `user:<用户ID>` 发私信）。多通道可同时设 `YUQUE2GIT_DELIVER_TARGETS` JSON 数组。Agent 须先向 `/mark-pushed` 回调结构化 JSON，由 yuque2git 统一生成并投递最终文案；自定义 prompt 可用 `YUQUE2GIT_OPENCLAW_MESSAGE_TEMPLATE`，占位符见上表，其中 `{reply_contract}` 为 Agent 须遵守的 JSON 契约说明。OpenClaw 侧在 `~/.openclaw/openclaw.json` 的 `hooks` 下启用 Hooks（`hooks.enabled: true`、`hooks.token: "<共享密钥>"`），并确保 `channels.discord` 已配置且 Bot 能向目标频道发消息；main（或目标）Agent 能访问 yuque2git（如通过 `exec` 执行 `curl` 调用 `YUQUE2GIT_PUBLIC_URL/mark-pushed`），网络允许 Gateway 访问 yuque2git 服务。
+  - **HTTP 直连摘要（不经 Gateway 投递）**：与 `YUQUE2GIT_DELIVER_*` 目标组合使用。**QQ**：设 `YUQUE2GIT_DIRECT_SEND_URL`（+ 可选 TOKEN），仅对 `channel=qq` 且 `to` 为 `g:`/`p:` 的目标直连 Napcat。**Discord**：设 `YUQUE2GIT_DISCORD_BOT_TOKEN`（或 `DISCORD_BOT_TOKEN`），仅对 `channel=discord` 且 `to` 为 `channel:<id>` / `user:<id>` 的目标调 Discord Bot REST；长文按 2000 字切段。可同时配置两者，混合目标时各走各的后端；无法直连的目标（缺 Token/URL 或 to 格式不对）仍走 OpenClaw `/hooks/agent`。进程需能访问对应 API（Discord 若需代理，给 yuque2git 配 `HTTP_PROXY` 等）。
   - **推送频率**：默认提示词要求琐碎修改 `should_push=false`，重要/阶段性更新再推。仍偏频时可加 `YUQUE2GIT_OPENCLAW_MIN_DIFF_CHARS`、`YUQUE2GIT_OPENCLAW_COOLDOWN_SECONDS`（及可选 `YUQUE2GIT_OPENCLAW_COOLDOWN_BYPASS_CHARS`），详见上表与 [docs/openclaw-summary-prompt.md](docs/openclaw-summary-prompt.md)。
 
 ## 回调失败自救（Runbook）
@@ -175,6 +177,6 @@ curl -sS -X POST "http://127.0.0.1:8765/mark-pushed" \
 
 ## 元数据
 
-每篇文档为单文件：**YAML frontmatter**（机读）+ **文档开头 Markdown 表格**（作者、创建时间、更新时间等，人读）+ 正文。frontmatter 含 `yuque_id`、`title`、`slug`、`repo_id`、`repo_slug`、`created_at`、`updated_at`、`user_id`、`last_editor_id`、`author_name` 等，与语雀 get_doc_detail 一致。
+每篇文档为单文件：**YAML frontmatter**（机读）+ **文档开头 Markdown 表格**（作者、创建时间、更新时间等，人读）+ 正文。frontmatter 主要含 `id`、`title`、`slug`、`created_at`、`updated_at`、`author`（**文档创建者**，非最后编辑人）、`book_name`、`description`、`cover` 等；表格中的「作者」列与 `author` 一致。
 
 输出目录根下另有 **`.yuque-id-to-path.json`**：记录 `yuque_id → 相对路径`，用于文档移动后仍能按「旧路径 vs 新路径」正确算 diff，与 `.yuque-last-push.json` 一起由服务与全量同步维护。

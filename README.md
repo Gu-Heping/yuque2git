@@ -26,7 +26,7 @@
 - **目录结构**：`{OUTPUT_DIR}/{知识库名}/{父路径}/{文档标题}.md`。根下另有 `.yuque-id-to-path.json`（id→路径）、`.yuque-last-push.json`（上次推送）、`.yuque-members.json`（团队姓名缓存）。
 - **智能 diff**：推送判定以前一次推送为基准；文档在语雀中移动父节点时，仍能按旧路径 vs 新路径正确 diff（依赖 `.yuque-id-to-path.json`）。
 - **Token 优化**：无实质变更不调 LLM；默认只对正文做 diff（`ENABLE_BODY_ONLY_DIFF=true`）。
-- **Markdown**：frontmatter 仅保留 Obsidian 友好字段（id、title、slug、created_at、updated_at、author、book_name、description、cover）；作者优先用团队内姓名（全量同步拉取并缓存）。
+- **Markdown**：frontmatter 仅保留 Obsidian 友好字段（id、title、slug、created_at、updated_at、author、book_name、description、cover）；`author` 为**文档创建者**（非最后编辑人、非 Webhook 触发人），优先用团队内姓名（全量同步拉取并缓存，缺省时 `GET /users/:id` 补全）。
 - **时间**：`created_at`/`updated_at` 为本地可读时间（`YYYY-MM-DD HH:MM:SS`），时区由 `YUQUE_TIMEZONE` 指定，默认 `Asia/Shanghai`。
 
 ---
@@ -34,7 +34,7 @@
 ## 与 OpenClaw 对接
 
 - **模式**：`PUSH_DECISION_MODE=openclaw`，并设置 `OPENCLAW_CALLBACK_URL`（如 `http(s)://<gateway>:<port>/hooks/agent`）、`OPENCLAW_HOOKS_TOKEN`，可选 `YUQUE2GIT_PUBLIC_URL`。
-- **投递目标**：`YUQUE2GIT_DELIVER_CHANNEL=qq`、`YUQUE2GIT_DELIVER_TO=<ID>`。多目标时 `YUQUE2GIT_DELIVER_TO` 可逗号分隔（如 `1179350197,g:1087044655`），或使用 `YUQUE2GIT_DELIVER_TARGETS` JSON 数组；服务端会在收到合法结构化摘要后向每个目标单独 POST，两次 POST 间隔由 `YUQUE2GIT_DELIVER_DELAY_SECONDS` 控制（默认 2 秒），避免 rate limit。
+- **投递目标**：`YUQUE2GIT_DELIVER_CHANNEL` / `TO` 或 `YUQUE2GIT_DELIVER_TARGETS`（QQ：`g:`/`p:`；Discord：`channel:`/`user:`）。**摘要落地方式**：若配置了 `YUQUE2GIT_DIRECT_SEND_URL`，匹配到的 **qq** 目标走 Napcat OneBot；若配置了 `YUQUE2GIT_DISCORD_BOT_TOKEN`（或 `DISCORD_BOT_TOKEN`），匹配到的 **discord** 目标走 Discord Bot REST；其余目标仍 POST 到 OpenClaw `/hooks/agent`。可同时启用两种直连。多目标间隔见 `YUQUE2GIT_DELIVER_DELAY_SECONDS`。
 - **直连发 QQ（B 方案）**：若希望摘要**不经 Gateway 再跑 Agent**、直接发到 QQ，可设置 `YUQUE2GIT_DIRECT_SEND_URL`（如 `http://127.0.0.1:3000`，即 Napcat OneBot 11 HTTP API 地址）。此时摘要由 yuque2git 直连 Napcat 的 `send_group_msg` / `send_private_msg` 发送，QQ 收到的是 OpenClaw 回调中的摘要原文。可选 `YUQUE2GIT_DIRECT_SEND_TOKEN` 与 Napcat HTTP 服务的 token 一致时用于鉴权。部署时需保证 yuque2git 能访问该端口（本机 3000 或宿主机映射）。
 - **429 重试**：若 Gateway/上游返回 429（API rate limit），服务会自动重试（默认最多 3 次、指数退避），可通过环境变量 `YUQUE2GIT_DELIVER_MAX_RETRIES` 调整；仍失败时会在日志中打出 warning。
 - **推送降噪与质量**：默认提示词要求 Agent **保守**：琐碎修改应 `should_push=false`，仅在阶段性/实质性更新或 diff 含重要信息时再 `should_push=true`（详见契约中的「推送门槛」）。若仍偏频，可设 `YUQUE2GIT_OPENCLAW_MIN_DIFF_CHARS`（过小 diff 不打扰 OpenClaw）、`YUQUE2GIT_OPENCLAW_COOLDOWN_SECONDS`（成功投递后同文档冷却；可选 `YUQUE2GIT_OPENCLAW_COOLDOWN_BYPASS_CHARS` 大 diff 仍触发）。

@@ -37,6 +37,9 @@ from webhook_server import (
     _is_openclaw_hooks_agent_url,
     _openclaw_precall_skip_reason,
     _record_openclaw_push_cooldown_now,
+    _parse_deliver_targets,
+    _partition_deliver_targets,
+    _split_discord_message_content,
     mark_pushed,
     MarkPushedBody,
     WebhookPayload,
@@ -174,6 +177,210 @@ class TestRenderLakesheetMarkdown:
     def test_invalid_payload_falls_back_to_raw_text(self):
         raw = _render_lakesheet_markdown("not-json")
         assert raw == "not-json"
+
+
+class TestRenderLaketableMarkdown:
+    def test_laketable_rendered_as_readable_tsv(self):
+        """测试 laketable 多维表格转换为 TSV"""
+        from webhook_server import _render_laketable_markdown
+
+        # 模拟语雀 laketable 数据结构
+        body = {
+            "format": "laketable",
+            "type": "Table",
+            "sheet": [{
+                "name": "活动表",
+                "columns": [
+                    {"name": "姓名", "type": "text", "id": "col1"},
+                    {"name": "状态", "type": "select", "id": "col2", "options": [
+                        {"id": "waiting", "value": "待开始"},
+                        {"id": "done", "value": "已完成"}
+                    ]},
+                    {"name": "日期", "type": "date", "id": "col3"},
+                ]
+            }]
+        }
+        body_table = {
+            "records": [
+                {
+                    "values": [
+                        {"value": "张三"},
+                        {"value": "waiting"},
+                        {"value": {"text": "2026-03-22", "seconds": 3983299200}}
+                    ]
+                },
+                {
+                    "values": [
+                        {"value": "李四"},
+                        {"value": "done"},
+                        {"value": {"text": "2026-03-23", "seconds": 3983385600}}
+                    ]
+                }
+            ],
+            "totalCount": 2
+        }
+
+        detail = {
+            "id": 123,
+            "title": "测试表格",
+            "format": "laketable",
+            "type": "Table",
+            "body": json.dumps(body, ensure_ascii=False),
+            "body_table": json.dumps(body_table, ensure_ascii=False),
+        }
+
+        md = _render_laketable_markdown(detail)
+        assert "Auto-generated from Yuque laketable" in md
+        assert "```tsv" in md
+        assert "姓名\t状态\t日期" in md
+        assert "张三\t待开始\t2026-03-22" in md
+        assert "李四\t已完成\t2026-03-23" in md
+        assert "\"format\": \"laketable\"" not in md
+
+    def test_laketable_empty_records(self):
+        """测试空表格"""
+        from webhook_server import _render_laketable_markdown
+
+        body = {
+            "format": "laketable",
+            "type": "Table",
+            "sheet": [{
+                "columns": [
+                    {"name": "文本", "type": "text", "id": "col1"},
+                ]
+            }]
+        }
+        body_table = {"records": [], "totalCount": 0}
+
+        detail = {
+            "id": 123,
+            "title": "空表",
+            "format": "laketable",
+            "body": json.dumps(body, ensure_ascii=False),
+            "body_table": json.dumps(body_table, ensure_ascii=False),
+        }
+
+        md = _render_laketable_markdown(detail)
+        assert "(empty)" in md
+
+    def test_laketable_mention_type(self):
+        """测试 mention（提及用户）类型"""
+        from webhook_server import _render_laketable_markdown
+
+        body = {
+            "format": "laketable",
+            "type": "Table",
+            "sheet": [{
+                "columns": [
+                    {"name": "参与者", "type": "mention", "id": "col1"},
+                ]
+            }]
+        }
+        body_table = {
+            "records": [
+                {
+                    "values": [
+                        {"value": [
+                            {"name": "张三", "login": "zhangsan"},
+                            {"name": "李四", "login": "lisi"}
+                        ]}
+                    ]
+                }
+            ]
+        }
+
+        detail = {
+            "id": 123,
+            "title": "参与者表",
+            "format": "laketable",
+            "body": json.dumps(body, ensure_ascii=False),
+            "body_table": json.dumps(body_table, ensure_ascii=False),
+        }
+
+        md = _render_laketable_markdown(detail)
+        assert "张三, 李四" in md
+
+    def test_laketable_mention_from_members_cache(self):
+        """测试 mention 从团队成员缓存获取姓名"""
+        from webhook_server import _render_laketable_markdown
+
+        body = {
+            "format": "laketable",
+            "type": "Table",
+            "sheet": [{
+                "columns": [
+                    {"name": "姓名", "type": "mention", "id": "col1"},
+                ]
+            }]
+        }
+        # 用户 id 是 58816971，但用户名是 "littlej"
+        body_table = {
+            "records": [
+                {
+                    "values": [
+                        {"value": [
+                            {"id": 58816971, "name": "littlej", "login": "yuqueyonghuu4lijg"}
+                        ]}
+                    ]
+                }
+            ]
+        }
+
+        detail = {
+            "id": 123,
+            "title": "测试表格",
+            "format": "laketable",
+            "body": json.dumps(body, ensure_ascii=False),
+            "body_table": json.dumps(body_table, ensure_ascii=False),
+        }
+
+        # 团队成员缓存：id 58816971 对应团队内姓名 "蒋泓宇"
+        members = {
+            "58816971": {"name": "蒋泓宇", "login": "jianghongyu"}
+        }
+
+        md = _render_laketable_markdown(detail, members)
+        # 应该使用团队内姓名，而不是语雀用户名
+        assert "蒋泓宇" in md
+        assert "littlej" not in md
+
+    def test_laketable_mention_fallback_without_cache(self):
+        """测试 mention 在没有缓存时回退到原始用户名"""
+        from webhook_server import _render_laketable_markdown
+
+        body = {
+            "format": "laketable",
+            "type": "Table",
+            "sheet": [{
+                "columns": [
+                    {"name": "姓名", "type": "mention", "id": "col1"},
+                ]
+            }]
+        }
+        body_table = {
+            "records": [
+                {
+                    "values": [
+                        {"value": [
+                            {"id": 99999999, "name": "张三", "login": "zhangsan"}
+                        ]}
+                    ]
+                }
+            ]
+        }
+
+        detail = {
+            "id": 123,
+            "title": "测试表格",
+            "format": "laketable",
+            "body": json.dumps(body, ensure_ascii=False),
+            "body_table": json.dumps(body_table, ensure_ascii=False),
+        }
+
+        # 没有该用户的缓存，应该使用原始用户名
+        members = {}
+        md = _render_laketable_markdown(detail, members)
+        assert "张三" in md
 
 
 class TestLastPush:
@@ -343,6 +550,85 @@ class TestLlmDecision:
 
         assert should_push is True
         assert summary == "新增了发布流程，并补充了回滚说明。"
+
+
+class TestParseDeliverTargets:
+    def test_discord_channel_target_from_env(self, monkeypatch):
+        monkeypatch.setattr(webhook_server, "YUQUE2GIT_DELIVER_TARGETS_JSON", "")
+        monkeypatch.setattr(webhook_server, "YUQUE2GIT_DELIVER_CHANNEL", "discord")
+        monkeypatch.setattr(webhook_server, "YUQUE2GIT_DELIVER_TO", "channel:123456789012345678")
+        assert _parse_deliver_targets() == [
+            {"channel": "discord", "to": "channel:123456789012345678"},
+        ]
+
+    def test_discord_user_dm_target_from_env(self, monkeypatch):
+        monkeypatch.setattr(webhook_server, "YUQUE2GIT_DELIVER_TARGETS_JSON", "")
+        monkeypatch.setattr(webhook_server, "YUQUE2GIT_DELIVER_CHANNEL", "discord")
+        monkeypatch.setattr(webhook_server, "YUQUE2GIT_DELIVER_TO", "user:972723264424124456")
+        assert _parse_deliver_targets() == [
+            {"channel": "discord", "to": "user:972723264424124456"},
+        ]
+
+    def test_mixed_qq_and_discord_from_json(self, monkeypatch):
+        raw = json.dumps(
+            [
+                {"channel": "qq", "to": "g:1087044655"},
+                {"channel": "discord", "to": "channel:111222333444555666"},
+            ]
+        )
+        monkeypatch.setattr(webhook_server, "YUQUE2GIT_DELIVER_TARGETS_JSON", raw)
+        monkeypatch.setattr(webhook_server, "YUQUE2GIT_DELIVER_CHANNEL", "qq")
+        monkeypatch.setattr(webhook_server, "YUQUE2GIT_DELIVER_TO", "ignored")
+        assert _parse_deliver_targets() == [
+            {"channel": "qq", "to": "g:1087044655"},
+            {"channel": "discord", "to": "channel:111222333444555666"},
+        ]
+
+
+class TestPartitionDeliverTargets:
+    def test_discord_to_direct_when_token_set(self, monkeypatch):
+        monkeypatch.setattr(webhook_server, "YUQUE2GIT_DIRECT_SEND_URL", "")
+        monkeypatch.setattr(webhook_server, "YUQUE2GIT_DISCORD_BOT_TOKEN", "fake-bot-token")
+        targets = [{"channel": "discord", "to": "channel:999"}]
+        d, g = _partition_deliver_targets(targets)
+        assert d == targets and g == []
+
+    def test_discord_to_gateway_when_no_token(self, monkeypatch):
+        monkeypatch.setattr(webhook_server, "YUQUE2GIT_DIRECT_SEND_URL", "")
+        monkeypatch.setattr(webhook_server, "YUQUE2GIT_DISCORD_BOT_TOKEN", "")
+        targets = [{"channel": "discord", "to": "channel:999"}]
+        d, g = _partition_deliver_targets(targets)
+        assert d == [] and g == targets
+
+    def test_qq_to_direct_when_napcat_url_set(self, monkeypatch):
+        monkeypatch.setattr(webhook_server, "YUQUE2GIT_DIRECT_SEND_URL", "http://127.0.0.1:3000")
+        monkeypatch.setattr(webhook_server, "YUQUE2GIT_DISCORD_BOT_TOKEN", "")
+        targets = [{"channel": "qq", "to": "g:1"}]
+        d, g = _partition_deliver_targets(targets)
+        assert d == targets and g == []
+
+    def test_mixed_routing(self, monkeypatch):
+        monkeypatch.setattr(webhook_server, "YUQUE2GIT_DIRECT_SEND_URL", "http://127.0.0.1:3000")
+        monkeypatch.setattr(webhook_server, "YUQUE2GIT_DISCORD_BOT_TOKEN", "tok")
+        targets = [
+            {"channel": "qq", "to": "g:1"},
+            {"channel": "discord", "to": "channel:2"},
+            {"channel": "discord", "to": "bad"},
+        ]
+        d, g = _partition_deliver_targets(targets)
+        assert d == [{"channel": "qq", "to": "g:1"}, {"channel": "discord", "to": "channel:2"}]
+        assert g == [{"channel": "discord", "to": "bad"}]
+
+
+class TestSplitDiscordContent:
+    def test_under_limit_single_chunk(self):
+        assert _split_discord_message_content("hi") == ["hi"]
+
+    def test_splits_at_2000(self):
+        s = "a" * 4500
+        parts = _split_discord_message_content(s, max_chars=2000)
+        assert len(parts) == 3
+        assert len(parts[0]) == 2000 and len(parts[1]) == 2000 and len(parts[2]) == 500
 
 
 class TestOpenClawPrompt:

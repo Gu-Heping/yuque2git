@@ -69,9 +69,32 @@ def _normalize_ts_local(ts: Optional[str]) -> str:
         return t
 
 
-def _author_name_from_detail(detail: Dict[str, Any]) -> str:
-    """从文档详情的 last_editor / creator / user 中取显示名。"""
-    for key in ("last_editor", "creator", "user"):
+def _creator_user_id(detail: Dict[str, Any]) -> Optional[int]:
+    """文档创建者用户 id：creator.id → user_id → user.id（不使用 last_editor）。"""
+    c = detail.get("creator")
+    if isinstance(c, dict) and c.get("id") is not None:
+        try:
+            return int(c["id"])
+        except (TypeError, ValueError):
+            pass
+    uid = detail.get("user_id")
+    if uid is not None:
+        try:
+            return int(uid)
+        except (TypeError, ValueError):
+            pass
+    u = detail.get("user")
+    if isinstance(u, dict) and u.get("id") is not None:
+        try:
+            return int(u["id"])
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def _creator_name_from_detail(detail: Dict[str, Any]) -> str:
+    """从文档详情中取创建者显示名：仅 creator / user 嵌套对象。"""
+    for key in ("creator", "user"):
         obj = detail.get(key)
         if isinstance(obj, dict):
             name = (obj.get("name") or obj.get("login") or "").strip()
@@ -174,6 +197,14 @@ class YuqueClient:
         r.raise_for_status()
         return r.json().get("data", {})
 
+    async def get_user_by_id(self, user_id: int) -> Optional[Dict]:
+        """GET /users/:id，与 webhook_server 一致，用于补全创建者姓名。"""
+        r = await self._get(f"/users/{user_id}")
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        return r.json().get("data", {})
+
     async def get_group_members_page(self, group_id: int, page: int) -> List[Dict]:
         """GET /groups/{id}/statistics/members 分页，与 yuque-sync-platform 一致。404（个人账号非团队）返回空列表。"""
         path = f"/groups/{group_id}/statistics/members?page={page}"
@@ -216,7 +247,7 @@ async def fetch_and_write_team_members(client: YuqueClient, group_id: int, outpu
         logger.info("Wrote .yuque-members.json with %s members", len(members))
 
 
-def _build_md(detail: Dict[str, Any], author_name: str = "") -> str:
+def _build_md(detail: Dict[str, Any], author_name: str = "", members: Optional[Dict] = None) -> str:
     """frontmatter 与 webhook_server 一致：仅 id/title/slug/created_at/updated_at/author/book_name/description/cover；时间为本地可读。"""
     created = _normalize_ts_local(detail.get("created_at") or "")
     updated = _normalize_ts_local(detail.get("updated_at") or detail.get("content_updated_at") or "")
@@ -244,7 +275,7 @@ def _build_md(detail: Dict[str, Any], author_name: str = "") -> str:
     md = "---\n" + yaml_block + "\n---\n\n"
     md += "| 作者 | 创建时间 | 更新时间 |\n|------|----------|----------|\n"
     md += f"| {author_display} | {table_cell(str(created))} | {table_cell(str(updated))} |\n\n"
-    md += _render_doc_body(detail)
+    md += _render_doc_body(detail, members)
     if not md.rstrip():
         pass
     elif not md.endswith("\n"):
@@ -252,9 +283,15 @@ def _build_md(detail: Dict[str, Any], author_name: str = "") -> str:
     return md
 
 
-def _render_doc_body(detail: Dict[str, Any]) -> str:
-    if (detail.get("format") or "").lower() == "lakesheet" or (detail.get("type") or "").lower() == "sheet":
+def _render_doc_body(detail: Dict[str, Any], members: Optional[Dict] = None) -> str:
+    fmt = (detail.get("format") or "").lower()
+    typ = (detail.get("type") or "").lower()
+    if fmt == "lakesheet" or typ == "sheet":
         rendered = _render_lakesheet_markdown(detail.get("body") or "")
+        if rendered:
+            return rendered
+    if fmt == "laketable" or typ == "table":
+        rendered = _render_laketable_markdown(detail, members)
         if rendered:
             return rendered
     return (detail.get("body") or "").strip()
@@ -291,6 +328,138 @@ def _render_lakesheet_markdown(raw_body: Any) -> str:
         blocks.append("```")
         blocks.append("")
     return "\n".join(blocks).strip()
+
+
+def _render_laketable_markdown(detail: Dict[str, Any], members: Optional[Dict] = None) -> str:
+    """将 laketable 多维表格转换为可读 TSV 格式
+
+    语雀 laketable 数据分布在两个字段：
+    - body: 表格元数据（列定义、视图、行 ID 列表）
+    - body_table: 实际数据（records 数组，每条记录的 values 按列顺序存储）
+    """
+    body = detail.get("body") or ""
+    body_table = detail.get("body_table") or ""
+
+    try:
+        body_data = json.loads(body) if isinstance(body, str) else body
+        table_data = json.loads(body_table) if isinstance(body_table, str) else body_table
+    except (TypeError, json.JSONDecodeError):
+        return str(body or "").strip()
+
+    sheet = body_data.get("sheet", [{}])[0] if body_data.get("sheet") else {}
+    columns = sheet.get("columns", [])
+    records = table_data.get("records", []) if isinstance(table_data, dict) else []
+
+    if not columns:
+        # 没有列定义，返回原始 JSON
+        return json.dumps(body_data, ensure_ascii=False, indent=2)
+
+    blocks: List[str] = [
+        "> Auto-generated from Yuque laketable for readable review and diff.",
+        "",
+    ]
+
+    sheet_name = sheet.get("name") or detail.get("title") or "Table"
+    blocks.append(f"## {sheet_name}")
+    blocks.append("")
+    blocks.append("```tsv")
+
+    # 表头
+    col_names = [c.get("name", c.get("id", "")) for c in columns]
+    blocks.append("\t".join(col_names))
+
+    # 数据行
+    if not records:
+        blocks.append("(empty)")
+    else:
+        for rec in records:
+            values = rec.get("values", [])
+            cells = []
+            for i, col in enumerate(columns):
+                cell_value = _laketable_value_to_text(values[i] if i < len(values) else None, col, members)
+                cells.append(cell_value)
+            blocks.append("\t".join(cells))
+
+    blocks.append("```")
+    blocks.append("")
+
+    return "\n".join(blocks).strip()
+
+
+def _laketable_value_to_text(cell: Any, col_def: Dict, members: Optional[Dict] = None) -> str:
+    """将 laketable 单元格值转换为文本"""
+    if cell is None:
+        return ""
+
+    # 处理 {"value": ...} 包装
+    if isinstance(cell, dict) and "value" in cell:
+        value = cell["value"]
+    else:
+        value = cell
+
+    if value is None:
+        return ""
+
+    col_type = col_def.get("type", "")
+
+    if col_type == "mention":
+        # 提及用户：优先从团队成员缓存获取姓名，多个用逗号分隔
+        if isinstance(value, list):
+            names = []
+            for u in value:
+                if isinstance(u, dict):
+                    uid = u.get("id")
+                    uid_str = str(uid) if uid else ""
+                    # 优先使用团队内姓名
+                    if members and uid_str in members:
+                        names.append(members[uid_str].get("name") or members[uid_str].get("login") or u.get("name") or u.get("login", ""))
+                    else:
+                        names.append(u.get("name", u.get("login", "")))
+            return ", ".join(names)
+        return str(value)
+
+    if col_type == "select":
+        # 单选：查找选项值
+        options = col_def.get("options", [])
+        for opt in options:
+            if opt.get("id") == value:
+                return opt.get("value", value)
+        return str(value) if value else ""
+
+    if col_type == "date":
+        # 日期：使用 text 字段
+        if isinstance(value, dict):
+            return value.get("text", value.get("time", ""))
+        return str(value)
+
+    if col_type == "link":
+        # 链接：显示 URL 或文本
+        if isinstance(value, dict):
+            return value.get("link", value.get("text", ""))
+        return str(value)
+
+    if col_type == "multiSelect":
+        # 多选：逗号分隔
+        if isinstance(value, list):
+            opt_ids = value
+            options = col_def.get("options", [])
+            names = []
+            for opt in options:
+                if opt.get("id") in opt_ids:
+                    names.append(opt.get("value", opt.get("id")))
+            return ", ".join(names)
+        return str(value)
+
+    # 默认：直接转字符串
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, dict):
+        return value.get("text", value.get("name", json.dumps(value, ensure_ascii=False)))
+    if isinstance(value, list):
+        return ", ".join(str(v) for v in value)
+    return str(value)
 
 
 def _sheet_to_tsv_lines(sheet: Dict[str, Any]) -> List[str]:
@@ -407,17 +576,42 @@ async def _process_toc_item(
                     old_full.unlink()
                     logger.info("  removed old path (move): %s", old_path)
         members = _read_members(output_dir)
-        user_id_str = str(detail.get("last_editor_id") or detail.get("user_id") or "")
+        creator_id = _creator_user_id(detail)
+        creator_id_str = str(creator_id) if creator_id is not None else ""
         author_name = ""
-        if user_id_str and user_id_str in members:
-            author_name = (members[user_id_str].get("name") or members[user_id_str].get("login") or "").strip()
+        if creator_id_str and creator_id_str in members:
+            author_name = (members[creator_id_str].get("name") or members[creator_id_str].get("login") or "").strip()
         if not author_name:
-            author_name = _author_name_from_detail(detail)
-        content = _build_md(detail, author_name)
+            author_name = _creator_name_from_detail(detail)
+        if not author_name and creator_id is not None:
+            try:
+                user_data = await client.get_user_by_id(creator_id)
+                if user_data:
+                    entry = {
+                        "name": (user_data.get("name") or "").strip(),
+                        "login": (user_data.get("login") or "").strip(),
+                    }
+                    members = _read_members(output_dir)
+                    members[creator_id_str] = entry
+                    _write_members(output_dir, members)
+                    author_name = (entry["name"] or entry["login"] or "").strip()
+            except Exception as e:
+                logger.warning("get_user_by_id %s failed: %s", creator_id, e)
+        content = _build_md(detail, author_name, members)
         out_file.write_text(content, encoding="utf-8")
         if yuque_id is not None and index is not None:
             index[str(yuque_id)] = rel_path
         logger.info("  wrote %s", out_file.relative_to(output_dir))
+
+        # DOC/SHEET 类型也可能有子节点，需递归处理
+        children = toc_list_children(toc_item.get("uuid"), toc_by_uuid)
+        if children:
+            # 子文档放在以父文档标题命名的子目录下
+            seg = _slug_safe(detail.get("title") or toc_item.get("title") or toc_item.get("uuid", ""))
+            child_parent_path = f"{parent_path}/{seg}" if parent_path else seg
+            (output_dir / repo_dir_name / child_parent_path).mkdir(parents=True, exist_ok=True)
+            for child in children:
+                await _process_toc_item(client, repo_id, repo_dir_name, output_dir, child, child_parent_path, toc_by_uuid, index, used_bases)
     elif doc_type == "TITLE":
         seg = _slug_safe(toc_item.get("title") or toc_item.get("uuid", ""))
         next_parent = f"{parent_path}/{seg}" if parent_path else seg
